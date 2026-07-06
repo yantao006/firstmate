@@ -73,8 +73,8 @@ Then just talk:
 # fm-fix-login-k3 and fm-dark-mode-p7.
 # Minutes later:
 
-  PR ready for review, captain: https://github.com/you/xyz/pull/42
-  (fix flaky login test - risk: low - CI green)
+  captain，PR 已准备好审核：https://github.com/you/xyz/pull/42
+  （修复登录测试不稳定 - 风险：低 - CI 已通过）
 
 > alright merge it
 ```

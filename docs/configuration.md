@@ -160,6 +160,7 @@ A pending mention with non-empty `text` is stored at `state/x-inbox/<request_id>
 The full relay object is preserved, including `in_reply_to: {author_handle, text}` when the mention is a reply in a conversation or `null` for fresh mentions.
 The `fmx-respond` skill decides whether the stashed mention is an actionable request, a question, or a pure acknowledgment.
 Actionable reversible requests are run through intake, backlog, dispatch, investigation, or ship flow as appropriate.
+The composed reply text follows AGENTS.md's captain-facing Chinese rule; handles, URLs, and exact quoted user terms can remain unchanged.
 If the work completes in that turn, the public reply reports the outcome.
 If the request spawns a longer-running task, firstmate posts an acknowledgement through the normal answer endpoint, links the task to the mention with `bin/fm-x-link.sh`, and posts one completion follow-up when the task reaches a terminal state.
 Pure acknowledgments or mentions with nothing to answer are dismissed through `bin/fm-x-dismiss.sh` before the local inbox file is cleared.
