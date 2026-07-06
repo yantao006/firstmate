@@ -56,11 +56,16 @@ BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-x-poll.XXXXXX") || exit 0
 AUTH_HEADER_FILE=
 trap 'rm -f "$BODY_FILE" "$AUTH_HEADER_FILE"' EXIT
 AUTH_HEADER_FILE=$(fmx_auth_header_file) || { emit_error_once "invalid token"; exit 0; }
+POLL_TIMEOUT=${FMX_POLL_TIMEOUT:-10}
+case "$POLL_TIMEOUT" in
+  ''|*[!0-9]*) POLL_TIMEOUT=10 ;;
+esac
+[ "$POLL_TIMEOUT" -gt 0 ] 2>/dev/null || POLL_TIMEOUT=10
 
 # Short, bounded poll: a failure or timeout simply means "no wake this cycle";
-# the next check cycle retries. -m 5 keeps this well inside the watcher's
+# the next check cycle retries. The default 10s stays well inside the watcher's
 # per-check timeout so the supervision loop is never starved.
-code=$(curl -m 5 -s -o "$BODY_FILE" -w '%{http_code}' \
+code=$(curl -m "$POLL_TIMEOUT" -s -o "$BODY_FILE" -w '%{http_code}' \
   -H "@$AUTH_HEADER_FILE" \
   -H 'Accept: application/json' \
   "$FMX_RELAY/connector/poll" 2>/dev/null) || exit 0
