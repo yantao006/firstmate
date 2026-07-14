@@ -129,21 +129,22 @@ There is no default source, `all`, wildcard, registry-wide search, or implicit f
 When several sources are explicitly named, each database is opened independently in caller order and its results are appended in that order.
 The per-source limit is between 1 and 100 and defaults to 20.
 
-`sync` always builds a complete new database in the index directory and atomically renames it over the old database only after integrity checks pass.
-Every database command is launched by a Python supervisor that opens the selected index directory from the filesystem root one component at a time without following symlinks and retains that stable directory descriptor until the command finishes.
-Sync and removal additionally retain an exclusive lock on that directory descriptor for the full child lifetime.
-Child commands reject inherited internal descriptors unless their parent is the live supervisor, its control pipe remains open, and the descriptor matches the selected locator.
-Mutating children acquire and retain the exclusive lock on their inherited stable directory descriptor for their full lifetime, so a wrapper cannot pass a momentarily locked descriptor and later release the operation lock.
+`sync` always builds a complete new database in a private operation directory under the selected state root and atomically renames it into the index locator only after integrity checks pass.
+Every database command is launched by a Python supervisor that opens the selected state root from the filesystem root one component at a time without following symlinks and retains an exclusive lock on that stable descriptor until the command finishes.
+The worker receives only the private operation directory and cannot publish, remove, or emit caller-visible success output.
+The supervisor alone snapshots databases for reads, commits prepared sync databases, quarantines removals, and releases buffered output.
+Inherited supervisor environment values are not authorization for index mutation.
 The database rename is the publication linearization point.
 The published database permanently identifies the exact source directory and registry snapshot used to build it, even if either current pathname is replaced after its final best-effort locator check.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
 Repeated unchanged sync produces one row per current relative path and cannot accumulate duplicates.
-Sync and removal serialize on an exclusive lock on the stable opened index-directory descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
+Sync and removal serialize on an exclusive lock on the stable opened state-root descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
 This deliberately serializes different sources as well as the same source in exchange for avoiding replaceable pathname lock anchors and retaining Bash 3.2 compatibility.
-Search and status create private snapshots relative to the stable descriptor, so replacing the index locator cannot redirect their reads or temporary writes.
-The supervisor buffers command output until the child exits, verifies that the selected locator still identifies the stable directory, and releases output only when both the command and that final identity check succeed.
-Sync and removal reopen the locator without following symlinks immediately before publication or deletion and fail closed if it no longer identifies the stable directory.
+Search and status receive private snapshots created by the supervisor before the worker starts, so the worker never reads through a detached index directory.
+The supervisor buffers command output until the worker exits, verifies that the index locator still identifies the directory opened at operation start, performs any final state-root-relative commit, and releases output only after success.
+Replacing the index directory during an operation cannot make the worker publish, read, or remove through the detached directory.
+An actor with the same operating-system identity can directly edit files in the selected state area and is outside this filesystem isolation boundary, but forged worker environment values do not grant the CLI supervisor's commit authority.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
 It quarantines the selected database with an atomic same-directory rename, verifies that the quarantined inode is the exact previously opened object, and only then unlinks it.

@@ -394,7 +394,7 @@ test_bash_32_parse_compatibility() {
 }
 
 test_forged_index_directory_fd_is_rejected() {
-  local index_dir="$HOME_DIR/state/knowledge-indexes" out
+  local index_dir="$HOME_DIR/state/knowledge-indexes" out before after forged_work
   mkdir -p "$index_dir"
   exec 9< "$index_dir"
   if out=$(FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_DIR_FD=9 \
@@ -405,7 +405,45 @@ test_forged_index_directory_fd_is_rejected() {
   exec 9<&-
   assert_contains "$out" 'refusing unverified index supervisor environment' \
     "forged index directory descriptor failure was not reported"
-  pass "index descriptor injection without a supervisor lock is rejected"
+  run_cli sync --source repo-a --json >/dev/null
+  before=$(sha_of "$index_dir/repo-a.sqlite3")
+  forged_work="$TMP_ROOT/forged-supervisor-work"
+  mkdir -p "$forged_work"
+  python3 - "$CLI" "$HOME_DIR" "$index_dir" "$forged_work" <<'PY'
+import os
+import subprocess
+import sys
+
+script, home, index, work = sys.argv[1:]
+directory_fd = os.open(index, os.O_RDONLY | os.O_DIRECTORY)
+control_read, control_write = os.pipe()
+environment = os.environ.copy()
+environment.update({
+    "FM_HOME": home,
+    "FM_KNOWLEDGE_INDEX_DIR_FD": str(directory_fd),
+    "FM_KNOWLEDGE_INDEX_CONTROL_FD": str(control_read),
+    "FM_KNOWLEDGE_INDEX_SUPERVISED": "1",
+    "FM_KNOWLEDGE_INDEX_SUPERVISOR_PID": str(os.getpid()),
+})
+completed = subprocess.run(
+    [script, "sync", "--source", "repo-a", "--json"],
+    cwd=work,
+    env=environment,
+    pass_fds=(directory_fd, control_read),
+    stdout=subprocess.PIPE,
+    check=False,
+)
+os.close(control_read)
+os.close(control_write)
+os.close(directory_fd)
+if completed.stdout:
+    raise SystemExit("forged wrapper received caller-visible success output")
+PY
+  after=$(sha_of "$index_dir/repo-a.sqlite3")
+  [ "$after" = "$before" ] || fail "forged supervisor wrapper published a database"
+  [ ! -e "$index_dir/.prepared-repo-a.sqlite3" ] \
+    || fail "forged supervisor wrapper wrote a prepared database into the index"
+  pass "forged supervisor environment has no commit or output authority"
 }
 
 test_index_locator_environment_is_ignored() {
@@ -757,6 +795,8 @@ test_post_verify_replacement_fails_closed() {
   fi
   [ ! -e "$race_home/state/knowledge-indexes/publish-race.sqlite3" ] \
     || fail "failed locator race published a database"
+  [ ! -e "$race_home/state/knowledge-indexes.detached/publish-race.sqlite3" ] \
+    || fail "failed locator race published into the detached index directory"
   pass "publication fails closed after locator replacement"
 }
 

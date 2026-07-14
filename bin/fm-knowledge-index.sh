@@ -36,6 +36,7 @@ REGISTRY="$CONFIG/knowledge-sources.json"
 INDEX_LOCATOR="$STATE/knowledge-indexes"
 if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
   INDEX_DIR=.
+  exec > .knowledge-worker-output
 else
   INDEX_DIR=$INDEX_LOCATOR
 fi
@@ -84,7 +85,7 @@ die() {
 
 require_tools() {
   local tool
-  for tool in jq sqlite3 find sort git python3; do
+  for tool in jq sqlite3 find sort git python3 sed; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
   done
   if command -v shasum >/dev/null 2>&1; then
@@ -584,39 +585,10 @@ try:
         open(gate + ".ready", "w", encoding="utf-8").close()
         while not os.path.exists(gate + ".release"):
             time.sleep(0.01)
-    index_fd_value = os.environ.get("FM_KNOWLEDGE_INDEX_DIR_FD")
-    if index_fd_value:
-        index_fd = os.dup(int(index_fd_value))
-    else:
-        index_directory = os.path.dirname(destination)
-        index_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-        for part in index_directory.split("/")[1:]:
-            next_fd = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=index_fd,
-            )
-            os.close(index_fd)
-            index_fd = next_fd
+    index_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         temporary_name = os.path.basename(temporary)
-        destination_name = os.path.basename(destination)
-        locator_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            for part in os.environ["INDEX_LOCATOR"].split("/")[1:]:
-                next_fd = os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=locator_fd,
-                )
-                os.close(locator_fd)
-                locator_fd = next_fd
-            locator = os.fstat(locator_fd)
-            stable = os.fstat(index_fd)
-            if (locator.st_dev, locator.st_ino) != (stable.st_dev, stable.st_ino):
-                raise OSError("index directory locator changed before publication")
-        finally:
-            os.close(locator_fd)
+        destination_name = ".prepared-" + os.path.basename(destination)
         temporary_fd = os.open(
             temporary_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=index_fd
         )
@@ -632,13 +604,6 @@ try:
             src_dir_fd=index_fd,
             dst_dir_fd=index_fd,
         )
-        destination_fd = os.open(
-            destination_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=index_fd
-        )
-        try:
-            os.fchmod(destination_fd, 0o600)
-        finally:
-            os.close(destination_fd)
     finally:
         os.close(index_fd)
     os.close(registry_fd)
@@ -691,17 +656,17 @@ safe_relative_path() {
 
 ensure_index_dir() {
   if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
-    python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" <<'PY' \
+    python3 - <<'PY' \
       || die "cannot access stable index directory: $INDEX_DIR"
 import os
 import stat
-import sys
 
-fd = int(sys.argv[1])
+fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 provided = os.fstat(fd)
 if not stat.S_ISDIR(provided.st_mode):
     raise OSError("index descriptor is not a directory")
 os.fchmod(fd, 0o700)
+os.close(fd)
 PY
     return
   fi
@@ -720,42 +685,6 @@ coordinate_index_operation() {
   if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
     [ "$PPID" -eq "$FM_KNOWLEDGE_INDEX_SUPERVISOR_PID" ] \
       || die "cannot verify index operation supervisor"
-    INDEX_LOCATOR=$INDEX_LOCATOR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" "$$" "$FM_KNOWLEDGE_INDEX_CONTROL_FD" "$mode" <<'PY' \
-      || die "cannot verify index operation supervisor"
-import fcntl
-import os
-import stat
-import sys
-
-fd = int(sys.argv[1])
-supervisor_pid = int(sys.argv[2])
-control_fd = int(sys.argv[3])
-mode = sys.argv[4]
-if os.getppid() != supervisor_pid:
-    raise OSError("index supervisor identity mismatch")
-if not stat.S_ISFIFO(os.fstat(control_fd).st_mode):
-    raise OSError("index supervisor control descriptor is invalid")
-provided = os.fstat(fd)
-if not stat.S_ISDIR(provided.st_mode):
-    raise OSError("index descriptor is not a directory")
-expected_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-try:
-    for part in os.environ["INDEX_LOCATOR"].split("/")[1:]:
-        next_fd = os.open(
-            part,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=expected_fd,
-        )
-        os.close(expected_fd)
-        expected_fd = next_fd
-    expected = os.fstat(expected_fd)
-    if (provided.st_dev, provided.st_ino) != (expected.st_dev, expected.st_ino):
-        raise OSError("index descriptor does not match selected state area")
-    if mode == "write":
-        fcntl.flock(fd, fcntl.LOCK_EX)
-finally:
-    os.close(expected_fd)
-PY
     return
   fi
   if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}${FM_KNOWLEDGE_INDEX_SUPERVISOR_PID:-}${FM_KNOWLEDGE_INDEX_CONTROL_FD:-}${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" ]; then
@@ -766,17 +695,20 @@ PY
     -u FM_KNOWLEDGE_INDEX_SUPERVISED \
     -u FM_KNOWLEDGE_INDEX_SUPERVISOR_PID \
     -u FM_KNOWLEDGE_INDEX_CONTROL_FD \
-    python3 - "$INDEX_LOCATOR" "$CONFIG" "$mode" "$SCRIPT_DIR/$(basename "$0")" "${ORIGINAL_ARGS[@]}" <<'PY'
+    python3 - "$STATE" "$CONFIG" "$mode" "$SCRIPT_DIR/$(basename "$0")" "${ORIGINAL_ARGS[@]}" <<'PY'
 import fcntl
 import os
+import secrets
+import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 
-index_dir, config_dir, mode, script, *arguments = sys.argv[1:]
+state_dir, config_dir, mode, script, *arguments = sys.argv[1:]
 fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
-    for part in index_dir.split("/")[1:]:
+    for part in state_dir.split("/")[1:]:
         try:
             next_fd = os.open(
                 part,
@@ -793,55 +725,233 @@ try:
         os.close(fd)
         fd = next_fd
     if not stat.S_ISDIR(os.fstat(fd).st_mode):
-        raise OSError("index path is not a directory")
+        raise OSError("state path is not a directory")
     os.fchmod(fd, 0o700)
-    if mode == "write":
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        os.mkdir("knowledge-indexes", 0o700, dir_fd=fd)
+    except FileExistsError:
+        pass
+    index_fd = os.open(
+        "knowledge-indexes",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=fd,
+    )
+    index_identity = os.fstat(index_fd)
+    work_name = ".knowledge-operation-" + secrets.token_hex(12)
+    os.mkdir(work_name, 0o700, dir_fd=fd)
+    work_fd = os.open(
+        work_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+    )
+    command = arguments[0]
+    sources = [arguments[index + 1] for index, value in enumerate(arguments[:-1]) if value == "--source"]
+    if command in ("search", "status"):
+        for source in sources:
+            source_fd = os.open(
+                source + ".sqlite3", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=index_fd
+            )
+            try:
+                info = os.fstat(source_fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError("database is not regular")
+                destination_fd = os.open(
+                    source + ".sqlite3",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=work_fd,
+                )
+                try:
+                    while True:
+                        chunk = os.read(source_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        os.write(destination_fd, chunk)
+                    os.fsync(destination_fd)
+                finally:
+                    os.close(destination_fd)
+            finally:
+                os.close(source_fd)
     control_read, control_write = os.pipe()
-    os.set_inheritable(fd, True)
+    os.set_inheritable(work_fd, True)
     os.set_inheritable(control_read, True)
     environment = os.environ.copy()
-    environment["FM_KNOWLEDGE_INDEX_DIR_FD"] = str(fd)
+    environment["FM_KNOWLEDGE_INDEX_DIR_FD"] = str(work_fd)
     environment["FM_KNOWLEDGE_INDEX_SUPERVISED"] = "1"
     environment["FM_KNOWLEDGE_INDEX_SUPERVISOR_PID"] = str(os.getpid())
     environment["FM_KNOWLEDGE_INDEX_CONTROL_FD"] = str(control_read)
-    environment["FM_STATE_OVERRIDE"] = os.path.dirname(index_dir)
+    environment["FM_STATE_OVERRIDE"] = state_dir
     environment["FM_CONFIG_OVERRIDE"] = config_dir
-    environment["INDEX_LOCATOR"] = index_dir
+    environment["INDEX_LOCATOR"] = os.path.join(state_dir, "knowledge-indexes")
     environment["INDEX_DIR"] = "."
     completed = subprocess.run(
         [script] + arguments,
         env=environment,
-        pass_fds=(fd, control_read),
-        preexec_fn=lambda: os.fchdir(fd),
+        pass_fds=(work_fd, control_read),
+        preexec_fn=lambda: os.fchdir(work_fd),
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
     )
-    locator_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in index_dir.split("/")[1:]:
-            next_fd = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=locator_fd,
-            )
-            os.close(locator_fd)
-            locator_fd = next_fd
-        locator = os.fstat(locator_fd)
-        stable = os.fstat(fd)
-        locator_matches = (locator.st_dev, locator.st_ino) == (stable.st_dev, stable.st_ino)
-    except OSError:
-        locator_matches = False
-    finally:
-        os.close(locator_fd)
+        output_fd = os.open(
+            ".knowledge-worker-output", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=work_fd
+        )
+        try:
+            chunks = []
+            while True:
+                chunk = os.read(output_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            completed.stdout = b"".join(chunks)
+        finally:
+            os.close(output_fd)
+    except FileNotFoundError:
+        completed.stdout = b""
     os.close(control_read)
     os.close(control_write)
-    if locator_matches:
+    current_index_fd = os.open(
+        "knowledge-indexes",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=fd,
+    )
+    try:
+        current_identity = os.fstat(current_index_fd)
+        locator_matches = (
+            current_identity.st_dev,
+            current_identity.st_ino,
+        ) == (index_identity.st_dev, index_identity.st_ino)
+    finally:
+        os.close(current_index_fd)
+    if not locator_matches:
+        if completed.returncode != 0 and completed.stdout:
+            sys.stdout.buffer.write(completed.stdout)
+        if completed.stderr:
+            sys.stderr.buffer.write(completed.stderr)
+        sys.exit(completed.returncode or 1)
+    if completed.returncode == 0 and command == "sync":
+        source = sources[0]
+        os.rename(
+            work_name + "/.prepared-" + source + ".sqlite3",
+            "knowledge-indexes/" + source + ".sqlite3",
+            src_dir_fd=fd,
+            dst_dir_fd=fd,
+        )
+    elif completed.returncode == 0 and command == "remove":
+        source = sources[0]
+        quarantine = ".knowledge-remove-" + secrets.token_hex(12) + ".sqlite3"
+        try:
+            target_fd = os.open(
+                source + ".sqlite3",
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=index_fd,
+            )
+            try:
+                expected_target = os.fstat(target_fd)
+                if not stat.S_ISREG(expected_target.st_mode):
+                    raise OSError("database is not regular")
+            finally:
+                os.close(target_fd)
+            gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_REMOVE_VERIFY")
+            if gate:
+                open(gate + ".ready", "w", encoding="utf-8").close()
+                while not os.path.exists(gate + ".release"):
+                    import time
+                    time.sleep(0.01)
+            os.rename(
+                "knowledge-indexes/" + source + ".sqlite3",
+                quarantine,
+                src_dir_fd=fd,
+                dst_dir_fd=fd,
+            )
+        except FileNotFoundError:
+            removed = False
+        else:
+            try:
+                actual = os.stat(quarantine, dir_fd=fd, follow_symlinks=False)
+                if (actual.st_dev, actual.st_ino) != (
+                    expected_target.st_dev,
+                    expected_target.st_ino,
+                ):
+                    raise OSError("database changed during exact removal")
+                validation_name = ".remove-validation.sqlite3"
+                source_fd = os.open(quarantine, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                destination_fd = os.open(
+                    validation_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=work_fd,
+                )
+                try:
+                    while True:
+                        chunk = os.read(source_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        os.write(destination_fd, chunk)
+                finally:
+                    os.close(source_fd)
+                    os.close(destination_fd)
+                original_cwd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+                os.fchdir(work_fd)
+                connection = sqlite3.connect(
+                    "file:" + validation_name + "?mode=ro", uri=True
+                )
+                stored = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'source_id'"
+                ).fetchone()
+                connection.close()
+                os.fchdir(original_cwd)
+                os.close(original_cwd)
+                if stored != (source,):
+                    raise OSError("database metadata mismatch")
+                os.unlink(quarantine, dir_fd=fd)
+                removed = True
+            except Exception:
+                try:
+                    os.stat(
+                        "knowledge-indexes/" + source + ".sqlite3",
+                        dir_fd=fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    os.rename(
+                        quarantine,
+                        "knowledge-indexes/" + source + ".sqlite3",
+                        src_dir_fd=fd,
+                        dst_dir_fd=fd,
+                    )
+                raise
+        if "--json" in arguments:
+            completed.stdout = (
+                '{"schema":"fm-knowledge-index.remove.v1","source":"%s",'
+                '"database":"%s/knowledge-indexes/%s.sqlite3","removed":%s}\n'
+                % (source, state_dir, source, str(removed).lower())
+            ).encode()
+        else:
+            completed.stdout = (
+                "removed=%s source=%s index=%s/knowledge-indexes/%s.sqlite3\n"
+                % (str(removed).lower(), source, state_dir, source)
+            ).encode()
+    if completed.returncode == 0:
         sys.stdout.buffer.write(completed.stdout)
         sys.stdout.buffer.flush()
-        sys.exit(completed.returncode)
-    sys.exit(completed.returncode or 1)
+    else:
+        if completed.stdout:
+            sys.stdout.buffer.write(completed.stdout)
+            sys.stdout.buffer.flush()
+        if completed.stderr:
+            sys.stderr.buffer.write(completed.stderr)
+            sys.stderr.buffer.flush()
+    sys.exit(completed.returncode)
 finally:
+    try:
+        os.fchdir(fd)
+        shutil.rmtree(work_name)
+    except (NameError, OSError):
+        pass
+    for descriptor in (locals().get("work_fd"), locals().get("index_fd")):
+        if descriptor is not None:
+            os.close(descriptor)
     os.close(fd)
 PY
   exit $?
@@ -1150,7 +1260,7 @@ compile_fts_query() {
   read -r -a tokens <<< "$cleaned"
   [ "${#tokens[@]}" -gt 0 ] || die "search query has no tokens"
   for token in "${tokens[@]}"; do
-    escaped=${token//\"/\"\"}
+    escaped=$(printf '%s' "$token" | sed 's/"/""/g')
     compiled="${compiled}${compiled:+ AND }\"${escaped}\"*"
   done
   printf '%s' "$compiled"
@@ -1279,71 +1389,7 @@ command_remove() {
   [ "$confirm" = "$id" ] \
     || die "removal requires --confirm $id"
   db=$(database_path "$id")
-  removed=$(python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" "$id.sqlite3" <<'PY'
-import os
-import secrets
-import stat
-import sys
-import time
-
-directory_fd = os.dup(int(sys.argv[1]))
-name = sys.argv[2]
-try:
-    locator_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for part in os.environ["INDEX_LOCATOR"].split("/")[1:]:
-            next_fd = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=locator_fd,
-            )
-            os.close(locator_fd)
-            locator_fd = next_fd
-        locator = os.fstat(locator_fd)
-        stable = os.fstat(directory_fd)
-        if (locator.st_dev, locator.st_ino) != (stable.st_dev, stable.st_ino):
-            raise OSError("index directory locator changed before removal")
-    finally:
-        os.close(locator_fd)
-    try:
-        target_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-    except FileNotFoundError:
-        print("false")
-    else:
-        try:
-            expected = os.fstat(target_fd)
-            if not stat.S_ISREG(expected.st_mode):
-                raise OSError("database is not regular")
-        finally:
-            os.close(target_fd)
-        gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_REMOVE_VERIFY")
-        if gate:
-            open(gate + ".ready", "w", encoding="utf-8").close()
-            while not os.path.exists(gate + ".release"):
-                time.sleep(0.01)
-        quarantine = ".remove-%s-%s" % (name, secrets.token_hex(12))
-        os.rename(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        quarantine_fd = os.open(
-            quarantine, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd
-        )
-        try:
-            actual = os.fstat(quarantine_fd)
-        finally:
-            os.close(quarantine_fd)
-        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
-            try:
-                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                os.rename(
-                    quarantine, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
-                )
-            raise OSError("database changed during exact removal")
-        os.unlink(quarantine, dir_fd=directory_fd)
-        print("true")
-finally:
-    os.close(directory_fd)
-PY
-  ) || die "refusing to remove unsafe index path for $id"
+  removed=false
   if [ "$JSON" -eq 1 ]; then
     jq -cn --arg source "$id" --arg database "$db" --argjson removed "$removed" \
       '{schema:"fm-knowledge-index.remove.v1",source:$source,database:$database,removed:$removed}'
