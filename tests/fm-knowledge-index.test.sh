@@ -484,10 +484,10 @@ test_directory_replacement_does_not_escape_root() {
   pass "root-bound snapshot rejects concurrent intermediate-directory replacement"
 }
 
-test_root_replacement_stays_bound_to_open_root() {
+test_root_replacement_rejects_stale_provenance() {
   local race_home="$TMP_ROOT/root-race-home" race_parent="$FIXTURES/root-race-parent"
   local race_root="$race_parent/source" outside="$FIXTURES/root-race-outside"
-  local gate="$TMP_ROOT/root-race-snapshot" sync_pid out
+  local gate="$TMP_ROOT/root-race-publish" sync_pid before_sha after_sha out
   mkdir -p "$race_home/config" "$race_root/records" "$outside/records"
   printf '# Safe\nrootboundsafecanary\n' > "$race_root/records/race.md"
   printf '# Foreign\nrootboundforeigncanary\n' > "$outside/records/race.md"
@@ -495,7 +495,10 @@ test_root_replacement_stays_bound_to_open_root() {
     '{schema:"firstmate.knowledge-sources.v1",sources:[
       {id:"root-race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
     ]}' > "$race_home/config/knowledge-sources.json"
-  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT="$gate" \
+  FM_HOME="$race_home" "$CLI" sync --source root-race --json >/dev/null
+  before_sha=$(sha_of "$race_home/state/knowledge-indexes/root-race.sqlite3")
+  printf '# Updated safe\nrootboundupdatedcanary\n' > "$race_root/records/race.md"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH="$gate" \
     "$CLI" sync --source root-race --json > "$TMP_ROOT/root-race-sync.out" 2> "$TMP_ROOT/root-race-sync.err" &
   sync_pid=$!
   while [ ! -e "$gate.ready" ]; do
@@ -506,12 +509,21 @@ test_root_replacement_stays_bound_to_open_root() {
   mkdir -p "$race_parent"
   cp -R "$outside" "$race_root"
   : > "$gate.release"
-  wait "$sync_pid" || fail "root-bound sync failed after pathname replacement"
+  if wait "$sync_pid"; then
+    fail "sync published provenance for a replaced registered root"
+  fi
+  after_sha=$(sha_of "$race_home/state/knowledge-indexes/root-race.sqlite3")
+  [ "$after_sha" = "$before_sha" ] \
+    || fail "root replacement changed the previous database"
   out=$(FM_HOME="$race_home" "$CLI" search --source root-race --query rootboundsafecanary --json)
   assert_result_count "$out" 1 "root-bound sync lost content from the opened root"
+  out=$(FM_HOME="$race_home" "$CLI" search --source root-race --query rootboundupdatedcanary --json)
+  assert_result_count "$out" 0 "failed root replacement sync published stale provenance"
   out=$(FM_HOME="$race_home" "$CLI" search --source root-race --query rootboundforeigncanary --json)
   assert_result_count "$out" 0 "root replacement redirected reads to foreign content"
-  pass "enumeration and reads remain bound to one stable root descriptor"
+  assert_contains "$(cat "$TMP_ROOT/root-race-sync.out")" 'source root changed before publishing' \
+    "root replacement did not report a pre-publish identity failure"
+  pass "root replacement rejects stale provenance and preserves the previous index"
 }
 
 test_fts5_diagnostic() {
@@ -543,5 +555,5 @@ test_safe_source_removal
 test_sync_remove_source_coordination
 test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
-test_root_replacement_stays_bound_to_open_root
+test_root_replacement_rejects_stale_provenance
 test_fts5_diagnostic

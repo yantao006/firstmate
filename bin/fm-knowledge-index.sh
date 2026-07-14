@@ -225,8 +225,8 @@ validate_all_roots() {
 }
 
 snapshot_source_tree() {
-  local root=$1 allows_json=$2 denies_json=$3 snapshot_dir=$4 file_list=$5
-  python3 - "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" <<'PY'
+  local root=$1 allows_json=$2 denies_json=$3 snapshot_dir=$4 file_list=$5 identity_file=$6
+  python3 - "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" "$identity_file" <<'PY'
 import fnmatch
 import json
 import os
@@ -235,7 +235,7 @@ import sys
 import time
 
 try:
-    root, allows_json, denies_json, snapshot_dir, file_list = sys.argv[1:]
+    root, allows_json, denies_json, snapshot_dir, file_list, identity_file = sys.argv[1:]
     allows = json.loads(allows_json)
     denies = json.loads(denies_json)
     directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
@@ -248,6 +248,8 @@ try:
             )
             os.close(directory_fd)
             directory_fd = next_fd
+
+        root_stat = os.fstat(directory_fd)
 
         candidates = []
 
@@ -351,9 +353,65 @@ try:
                     os.close(current_fd)
                 output.write(os.fsencode(relative_path) + b"\0")
                 output.write(os.fsencode(snapshot) + b"\0")
+
+        verification_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in root.split("/")[1:]:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=verification_fd,
+                )
+                os.close(verification_fd)
+                verification_fd = next_fd
+            verification_stat = os.fstat(verification_fd)
+            if (verification_stat.st_dev, verification_stat.st_ino) != (
+                root_stat.st_dev,
+                root_stat.st_ino,
+            ):
+                raise OSError("registered source root changed during snapshot")
+        finally:
+            os.close(verification_fd)
+
+        with open(identity_file, "w", encoding="ascii") as identity:
+            identity.write(f"{root_stat.st_dev} {root_stat.st_ino}\n")
+            identity.flush()
+            os.fsync(identity.fileno())
     finally:
         os.close(directory_fd)
 except OSError:
+    sys.exit(1)
+PY
+}
+
+verify_source_root_identity() {
+  local root=$1 identity_file=$2
+  python3 - "$root" "$identity_file" <<'PY'
+import os
+import sys
+
+try:
+    root, identity_file = sys.argv[1:]
+    with open(identity_file, "r", encoding="ascii") as identity:
+        expected = tuple(int(value) for value in identity.read().split())
+    if len(expected) != 2:
+        raise OSError("invalid source root identity")
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in root.split("/")[1:]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        current = os.fstat(directory_fd)
+        if (current.st_dev, current.st_ino) != expected:
+            raise OSError("registered source root no longer matches snapshot")
+    finally:
+        os.close(directory_fd)
+except (OSError, ValueError):
     sys.exit(1)
 PY
 }
@@ -477,7 +535,7 @@ command_validate() {
 command_sync() {
   local id=$1 root owner privacy repo commit indexed_at db tmp_db lines manifest file_list
   local rel physical sha count manifest_sql integrity allows_json denies_json
-  local snapshot_dir snapshot
+  local snapshot_dir snapshot root_identity
   local -a allows=() denies=()
   validate_registry_structure
   validate_source_id "$id"
@@ -503,12 +561,13 @@ command_sync() {
   lines=$(mktemp "$INDEX_DIR/.knowledge-manifest-lines.XXXXXX")
   manifest=$(mktemp "$INDEX_DIR/.knowledge-manifest.XXXXXX")
   file_list=$(mktemp "$INDEX_DIR/.knowledge-files.XXXXXX")
+  root_identity=$(mktemp "$INDEX_DIR/.knowledge-root-identity.XXXXXX")
   tmp_db=$(mktemp "$INDEX_DIR/.$id.sqlite3.tmp.XXXXXX")
   snapshot_dir=$(mktemp -d "$INDEX_DIR/.knowledge-snapshot.XXXXXX")
-  TEMP_FILES+=("$lines" "$manifest" "$file_list" "$tmp_db")
+  TEMP_FILES+=("$lines" "$manifest" "$file_list" "$root_identity" "$tmp_db")
   TEMP_DIRS+=("$snapshot_dir")
 
-  snapshot_source_tree "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" \
+  snapshot_source_tree "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" "$root_identity" \
     || die "cannot safely snapshot source tree for $id; previous index preserved"
 
   while IFS= read -r -d '' rel && IFS= read -r -d '' snapshot; do
@@ -635,6 +694,8 @@ SQL
       sleep 0.01
     done
   fi
+  verify_source_root_identity "$root" "$root_identity" \
+    || die "source root changed before publishing $id; previous index preserved"
   chmod 600 "$tmp_db"
   db=$(database_path "$id")
   mv -f -- "$tmp_db" "$db"

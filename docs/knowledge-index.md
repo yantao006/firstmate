@@ -70,6 +70,8 @@ They cannot remove or override these built-in denies:
 Only regular files whose names end in `.md` or `.markdown` are candidates.
 Directory and file symlinks are not followed.
 Sync opens the canonical root from the filesystem root one component at a time without following symlinks, then binds enumeration and every candidate read to that single directory descriptor.
+The snapshot records that opened directory's filesystem identity and reopens the registered path without following symlinks after copying and immediately before publication.
+If the registered path no longer names the opened directory, sync fails closed and preserves the previous database, so stored canonical paths cannot describe content read from a renamed tree.
 Every candidate must remain below that opened root, match at least one allow pattern, and match neither a built-in nor configured deny.
 
 ## Index storage and schema
