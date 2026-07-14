@@ -119,6 +119,7 @@ The per-source limit is between 1 and 100 and defaults to 20.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
 Repeated unchanged sync produces one row per current relative path and cannot accumulate duplicates.
+Sync and removal serialize on a source-scoped operation lock, so a same-source sync already in progress cannot publish after a confirmed removal returns, while different sources remain independent.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
 It removes only that source's exact disposable SQLite file.

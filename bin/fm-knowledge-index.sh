@@ -22,6 +22,7 @@ REGISTRY_SCHEMA="firstmate.knowledge-sources.v1"
 JSON=0
 TEMP_FILES=()
 TEMP_DIRS=()
+ORIGINAL_ARGS=("$@")
 
 cleanup() {
   local file directory
@@ -242,6 +243,37 @@ database_path() {
   printf '%s/%s.sqlite3\n' "$INDEX_DIR" "$1"
 }
 
+coordinate_source_operation() {
+  local id=$1 lock_file
+  if [ -n "${FM_KNOWLEDGE_INDEX_LOCKED_SOURCE:-}" ]; then
+    [ "$FM_KNOWLEDGE_INDEX_LOCKED_SOURCE" = "$id" ] \
+      || die "source operation lock does not match selected source $id"
+    return
+  fi
+  ensure_index_dir
+  lock_file="$INDEX_DIR/.$id.operation.lock"
+  [ ! -L "$lock_file" ] \
+    || die "source operation lock is not a regular file for $id"
+  if [ -e "$lock_file" ]; then
+    [ -f "$lock_file" ] \
+      || die "source operation lock is not a regular file for $id"
+  else
+    (umask 077; : > "$lock_file") \
+      || die "cannot create source operation lock for $id"
+  fi
+  chmod 600 "$lock_file"
+  if command -v flock >/dev/null 2>&1; then
+    FM_KNOWLEDGE_INDEX_LOCKED_SOURCE="$id" \
+      flock -x "$lock_file" "$SCRIPT_DIR/fm-knowledge-index.sh" "${ORIGINAL_ARGS[@]}"
+  elif command -v lockf >/dev/null 2>&1; then
+    FM_KNOWLEDGE_INDEX_LOCKED_SOURCE="$id" \
+      lockf -k "$lock_file" "$SCRIPT_DIR/fm-knowledge-index.sh" "${ORIGINAL_ARGS[@]}"
+  else
+    die "flock or lockf not found; cannot coordinate source operation for $id"
+  fi
+  exit $?
+}
+
 validate_database() {
   local id=$1 db=$2 stored integrity
   [ -f "$db" ] || die "index not found for $id; run sync --source $id"
@@ -452,6 +484,12 @@ SQL
   if [ "${FM_KNOWLEDGE_INDEX_TEST_FAIL_BEFORE_PUBLISH:-0}" = 1 ]; then
     die "injected pre-publish sync failure for $id; previous index preserved"
   fi
+  if [ -n "${FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH:-}" ]; then
+    : > "$FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH.ready"
+    while [ ! -e "$FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH.release" ]; do
+      sleep 0.01
+    done
+  fi
   chmod 600 "$tmp_db"
   db=$(database_path "$id")
   mv -f -- "$tmp_db" "$db"
@@ -660,6 +698,9 @@ case "$COMMAND" in
   sync)
     [ "${#SOURCES[@]}" -eq 1 ] && [ -z "$QUERY$CONFIRM" ] && [ "$LIMIT" -eq 20 ] \
       || die "sync requires exactly one --source and accepts only --json otherwise"
+    validate_registry_structure
+    validate_source_id "${SOURCES[0]}"
+    coordinate_source_operation "${SOURCES[0]}"
     command_sync "${SOURCES[0]}"
     ;;
   search)
@@ -675,6 +716,9 @@ case "$COMMAND" in
   remove)
     [ "${#SOURCES[@]}" -eq 1 ] && [ -n "$CONFIRM" ] && [ -z "$QUERY" ] && [ "$LIMIT" -eq 20 ] \
       || die "remove requires exactly one --source and --confirm"
+    validate_registry_structure
+    validate_source_id "${SOURCES[0]}"
+    coordinate_source_operation "${SOURCES[0]}"
     command_remove "${SOURCES[0]}" "$CONFIRM"
     ;;
   *) usage >&2; exit 2 ;;

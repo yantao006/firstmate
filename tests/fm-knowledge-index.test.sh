@@ -172,9 +172,10 @@ test_explicit_selection_and_retrieval() {
 }
 
 test_zero_foreign_source_leakage_and_provenance() {
-  local source canary foreign out repeated
+  local source canary foreign foreign_prefix out repeated
   local -a sources=(public repo-a repo-b fleet captain)
   local -a canaries=(publiccanary repoacanary repobcanary fleetcanary captaincanary)
+  local -a canary_prefixes=(publicc repoac repobc fleetc captainc)
   local i j
   for ((i=0; i<${#sources[@]}; i++)); do
     source=${sources[$i]}
@@ -198,8 +199,15 @@ test_zero_foreign_source_leakage_and_provenance() {
     for ((j=0; j<${#sources[@]}; j++)); do
       [ "$i" -eq "$j" ] && continue
       foreign=${canaries[$j]}
+      foreign_prefix=${canary_prefixes[$j]}
       out=$(search_json "$source" "$foreign")
       assert_result_count "$out" 0 "$source leaked foreign canary $foreign"
+      out=$(search_json "$source" "$foreign_prefix")
+      assert_result_count "$out" 0 "$source leaked foreign canary prefix $foreign_prefix"
+      out=$(search_json "$source" "$foreign\" OR $canary")
+      assert_result_count "$out" 0 "$source leaked foreign canary through metacharacters"
+      out=$(search_json "$source" "$foreign_prefix\" OR $canary")
+      assert_result_count "$out" 0 "$source leaked foreign canary prefix through metacharacters"
     done
   done
   out=$(search_json repo-a repoacanary)
@@ -338,6 +346,33 @@ test_safe_source_removal() {
   pass "fail-closed exact-source disposable index removal"
 }
 
+test_sync_remove_source_coordination() {
+  local gate="$TMP_ROOT/repo-b-sync-remove" sync_pid remove_pid remove_out
+  run_cli sync --source repo-b --json >/dev/null
+  printf '\ncoordinationcanary\n' >> "$REPO_B/records/shared.md"
+  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH="$gate" \
+    "$CLI" sync --source repo-b --json > "$TMP_ROOT/repo-b-sync.out" 2> "$TMP_ROOT/repo-b-sync.err" &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "sync exited before reaching the publication gate"
+    sleep 0.01
+  done
+  run_cli remove --source repo-b --confirm repo-b --json > "$TMP_ROOT/repo-b-remove.out" &
+  remove_pid=$!
+  sleep 0.1
+  kill -0 "$remove_pid" 2>/dev/null \
+    || fail "same-source remove returned while an earlier sync could still publish"
+  : > "$gate.release"
+  wait "$sync_pid" || fail "coordinated sync failed"
+  wait "$remove_pid" || fail "coordinated remove failed"
+  remove_out=$(cat "$TMP_ROOT/repo-b-remove.out")
+  [ "$(printf '%s' "$remove_out" | jq -r '.removed')" = true ] \
+    || fail "coordinated source removal did not remove the published index"
+  [ ! -e "$HOME_DIR/state/knowledge-indexes/repo-b.sqlite3" ] \
+    || fail "an earlier same-source sync republished after remove returned"
+  pass "source-scoped sync and remove coordination"
+}
+
 test_registry_path_traversal_and_root_rejection() {
   local invalid_home="$TMP_ROOT/invalid-home" invalid_registry="$TMP_ROOT/invalid-home/config/knowledge-sources.json"
   mkdir -p "$invalid_home/config"
@@ -403,5 +438,6 @@ test_sql_fts_metacharacter_safety
 test_atomic_failure_preserves_previous_index
 test_deletion_and_rename_propagation
 test_safe_source_removal
+test_sync_remove_source_coordination
 test_registry_path_traversal_and_root_rejection
 test_fts5_diagnostic
