@@ -410,7 +410,66 @@ test_registry_path_traversal_and_root_rejection() {
   if FM_HOME="$invalid_home" "$CLI" validate --json >/dev/null 2>&1; then
     fail "registry accepted a symlinked canonical root"
   fi
+  mkdir -p "$PUBLIC/nested-private"
+  printf '# Nested private\nnestedprivatecanary\n' > "$PUBLIC/nested-private/private.md"
+  jq -n --arg outer "$PUBLIC" --arg inner "$PUBLIC/nested-private" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"outer-public",root:$outer,owner:"Public Owner",privacy:"public",markdown_allow:["*.md"],deny:[]},
+      {id:"inner-private",root:$inner,owner:"Private Owner",privacy:"captain-private",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$invalid_registry"
+  if FM_HOME="$invalid_home" "$CLI" validate --json >/dev/null 2>&1; then
+    fail "registry accepted an outer source containing a private source root"
+  fi
+  if FM_HOME="$invalid_home" "$CLI" sync --source outer-public --json >/dev/null 2>&1; then
+    fail "sync accepted an outer source containing a private source root"
+  fi
+  [ ! -e "$invalid_home/state/knowledge-indexes/outer-public.sqlite3" ] \
+    || fail "overlapping outer source indexed nestedprivatecanary"
+  jq -n --arg outer "$PUBLIC" --arg inner "$PUBLIC/nested-private" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"inner-private",root:$inner,owner:"Private Owner",privacy:"captain-private",markdown_allow:["*.md"],deny:[]},
+      {id:"outer-public",root:$outer,owner:"Public Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$invalid_registry"
+  if FM_HOME="$invalid_home" "$CLI" validate --json >/dev/null 2>&1; then
+    fail "registry accepted a private source nested inside a later outer source"
+  fi
+  if FM_HOME="$invalid_home" "$CLI" sync --source outer-public --json >/dev/null 2>&1; then
+    fail "sync accepted a later outer source containing a private source root"
+  fi
+  [ ! -e "$invalid_home/state/knowledge-indexes/outer-public.sqlite3" ] \
+    || fail "later overlapping outer source indexed nestedprivatecanary"
+  rm -rf "$PUBLIC/nested-private"
   pass "source ID, pattern, root traversal, and symlink-root rejection"
+}
+
+test_directory_replacement_does_not_escape_root() {
+  local race_home="$TMP_ROOT/race-home" race_root="$FIXTURES/race-root"
+  local outside="$FIXTURES/race-outside" gate="$TMP_ROOT/race-snapshot" sync_pid
+  mkdir -p "$race_home/config" "$race_root/records" "$outside"
+  printf '# Safe\nsafesnapshotcanary\n' > "$race_root/records/race.md"
+  printf '# Foreign\nraceforeigncanary\n' > "$outside/race.md"
+  jq -n --arg root "$race_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT="$gate" \
+    "$CLI" sync --source race --json > "$TMP_ROOT/race-sync.out" 2> "$TMP_ROOT/race-sync.err" &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "race sync exited before reaching the snapshot gate"
+    sleep 0.01
+  done
+  mv "$race_root/records" "$race_root/records-original"
+  ln -s "$outside" "$race_root/records"
+  : > "$gate.release"
+  if wait "$sync_pid"; then
+    fail "sync followed a replaced intermediate directory outside its source root"
+  fi
+  [ ! -e "$race_home/state/knowledge-indexes/race.sqlite3" ] \
+    || fail "failed race sync published an index"
+  assert_contains "$(cat "$TMP_ROOT/race-sync.out")" 'cannot safely snapshot source file' \
+    "race sync did not report a safe snapshot failure"
+  pass "root-bound snapshot rejects concurrent intermediate-directory replacement"
 }
 
 test_fts5_diagnostic() {
@@ -441,4 +500,5 @@ test_deletion_and_rename_propagation
 test_safe_source_removal
 test_sync_remove_source_coordination
 test_registry_path_traversal_and_root_rejection
+test_directory_replacement_does_not_escape_root
 test_fts5_diagnostic

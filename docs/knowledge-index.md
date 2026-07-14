@@ -34,7 +34,7 @@ The complete version 1 schema is:
 
 The top-level object has exactly `schema` and `sources`.
 `schema` must equal `firstmate.knowledge-sources.v1`.
-`sources` is an array with no duplicate IDs or roots.
+`sources` is an array with no duplicate IDs.
 
 Each source object has exactly these fields:
 
@@ -53,6 +53,7 @@ Allow patterns must end in `.md` or `.markdown`, case-insensitively.
 Absolute patterns, empty segments, `.` or `..` segments, backslashes, and bracket expressions are rejected.
 
 Registry validation requires every root to exist and be canonical.
+Source roots are pairwise disjoint: no root may equal, contain, or be contained by another source root, regardless of registry order.
 Search, status, and removal validate the registry structure and selected source identity without requiring the canonical root to remain online, so a previously built projection remains usable after a failed sync.
 Sync additionally validates the selected root immediately before reading it.
 
@@ -109,6 +110,8 @@ fm-knowledge-index.sh search --source <id> [--source <id> ...] --query <text> [-
 fm-knowledge-index.sh status --source <id> [--json]
 fm-knowledge-index.sh remove --source <id> --confirm <id> [--json]
 ```
+
+Runtime dependencies are Bash, `jq`, SQLite with FTS5 and JSON functions, `find`, `sort`, Git, Python 3, either `shasum` or `sha256sum`, and either `flock` or `lockf`.
 
 Every search requires one or more explicit `--source` values.
 There is no default source, `all`, wildcard, registry-wide search, or implicit federation mode.

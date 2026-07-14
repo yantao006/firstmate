@@ -64,7 +64,7 @@ die() {
 
 require_tools() {
   local tool
-  for tool in jq sqlite3 find sort git; do
+  for tool in jq sqlite3 find sort git python3; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
   done
   if command -v shasum >/dev/null 2>&1; then
@@ -112,7 +112,8 @@ validate_pattern() {
 }
 
 validate_registry_structure() {
-  local pattern
+  local pattern index other_index root other_root
+  local -a roots=()
   [ -f "$REGISTRY" ] || die "registry not found: $REGISTRY"
   [ ! -L "$REGISTRY" ] || die "registry must not be a symlink: $REGISTRY"
   if ! jq -e --arg schema "$REGISTRY_SCHEMA" '
@@ -150,6 +151,21 @@ validate_registry_structure() {
   while IFS= read -r pattern; do
     validate_pattern "$pattern" deny
   done < <(jq -r '.sources[].deny[]' "$REGISTRY")
+  while IFS= read -r root; do
+    roots+=("$root")
+  done < <(jq -r '.sources[].root' "$REGISTRY")
+  for ((index=0; index<${#roots[@]}; index++)); do
+    root=${roots[$index]}
+    for ((other_index=index + 1; other_index<${#roots[@]}; other_index++)); do
+      other_root=${roots[$other_index]}
+      case "$root/" in
+        "$other_root/"*) die "source roots must not overlap: $root and $other_root" ;;
+      esac
+      case "$other_root/" in
+        "$root/"*) die "source roots must not overlap: $root and $other_root" ;;
+      esac
+    done
+  done
 }
 
 source_exists() {
@@ -189,6 +205,52 @@ validate_all_roots() {
   while IFS= read -r id; do
     validate_source_root "$id"
   done < <(jq -r '.sources[].id' "$REGISTRY")
+}
+
+snapshot_source_file() {
+  local root=$1 relative_path=$2 snapshot=$3
+  python3 - "$root" "$relative_path" "$snapshot" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    root, relative_path, snapshot = sys.argv[1:]
+    parts = relative_path.split("/")
+    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        source_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                raise OSError("source is not a regular file")
+            destination_fd = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_fd, view)
+                        view = view[written:]
+                os.fsync(destination_fd)
+            finally:
+                os.close(destination_fd)
+        finally:
+            os.close(source_fd)
+    finally:
+        os.close(directory_fd)
+except OSError:
+    sys.exit(1)
+PY
 }
 
 hash_file() {
@@ -348,8 +410,7 @@ command_sync() {
     rel=${file#"$root"/}
     safe_relative_path "$rel" || die "unsafe relative path under $id"
     [ -f "$file" ] && [ ! -L "$file" ] || continue
-    physical="$(cd "$(dirname "$file")" && pwd -P)/$(basename "$file")"
-    case "$physical" in "$root"/*) ;; *) die "file resolves outside source root: $rel" ;; esac
+    physical="$root/$rel"
     allowed=0
     for pattern in "${allows[@]}"; do
       if glob_matches "$rel" "$pattern"; then allowed=1; break; fi
@@ -364,7 +425,14 @@ command_sync() {
     [ "$denied" -eq 0 ] || continue
     ordinal=$((ordinal + 1))
     snapshot="$snapshot_dir/$ordinal.md"
-    cp -P -- "$file" "$snapshot" || die "cannot snapshot source file: $rel"
+    if [ -n "${FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT:-}" ]; then
+      : > "$FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT.ready"
+      while [ ! -e "$FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT.release" ]; do
+        sleep 0.01
+      done
+    fi
+    snapshot_source_file "$root" "$rel" "$snapshot" \
+      || die "cannot safely snapshot source file: $rel"
     [ -f "$snapshot" ] && [ ! -L "$snapshot" ] \
       || die "source file changed into a symlink while syncing: $rel"
     sha=$(hash_file "$snapshot") || die "cannot hash source file: $rel"
