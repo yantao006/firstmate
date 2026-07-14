@@ -82,6 +82,8 @@ Every candidate must remain below that opened root, match at least one allow pat
 
 Indexes live under `state/knowledge-indexes/` in the selected `FM_HOME` by default.
 `FM_STATE_OVERRIDE` changes the state directory for tests and specialized environments.
+The index locator is always derived from that selected state directory and cannot be overridden independently.
+Relative `FM_HOME` and `FM_STATE_OVERRIDE` values are resolved from the caller's invocation directory before supervised work begins.
 The index directory is mode `0700`, and every published SQLite database is mode `0600`.
 
 Each source has exactly one database named `<source-id>.sqlite3`.
@@ -130,7 +132,8 @@ The per-source limit is between 1 and 100 and defaults to 20.
 `sync` always builds a complete new database in the index directory and atomically renames it over the old database only after integrity checks pass.
 Every database command is launched by a Python supervisor that opens the selected index directory from the filesystem root one component at a time without following symlinks and retains that stable directory descriptor until the command finishes.
 Sync and removal additionally retain an exclusive lock on that directory descriptor for the full child lifetime.
-Child commands reject inherited internal descriptors unless their parent is the live supervisor, its control pipe remains open, the descriptor matches the selected locator, and mutating commands can prove the supervisor still holds the directory lock.
+Child commands reject inherited internal descriptors unless their parent is the live supervisor, its control pipe remains open, and the descriptor matches the selected locator.
+Mutating children acquire and retain the exclusive lock on their inherited stable directory descriptor for their full lifetime, so a wrapper cannot pass a momentarily locked descriptor and later release the operation lock.
 The database rename is the publication linearization point.
 The published database permanently identifies the exact source directory and registry snapshot used to build it, even if either current pathname is replaced after its final best-effort locator check.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
@@ -139,6 +142,7 @@ Repeated unchanged sync produces one row per current relative path and cannot ac
 Sync and removal serialize on an exclusive lock on the stable opened index-directory descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
 This deliberately serializes different sources as well as the same source in exchange for avoiding replaceable pathname lock anchors and retaining Bash 3.2 compatibility.
 Search and status create private snapshots relative to the stable descriptor, so replacing the index locator cannot redirect their reads or temporary writes.
+The supervisor buffers command output until the child exits, verifies that the selected locator still identifies the stable directory, and releases output only when both the command and that final identity check succeed.
 Sync and removal reopen the locator without following symlinks immediately before publication or deletion and fail closed if it no longer identifies the stable directory.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.

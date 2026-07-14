@@ -18,8 +18,22 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+CONFIG=$(python3 - "$CONFIG" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+)
+STATE=$(python3 - "$STATE" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+)
 REGISTRY="$CONFIG/knowledge-sources.json"
-INDEX_LOCATOR="${INDEX_LOCATOR:-$STATE/knowledge-indexes}"
+INDEX_LOCATOR="$STATE/knowledge-indexes"
 if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
   INDEX_DIR=.
 else
@@ -709,7 +723,6 @@ coordinate_index_operation() {
     INDEX_LOCATOR=$INDEX_LOCATOR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" "$$" "$FM_KNOWLEDGE_INDEX_CONTROL_FD" "$mode" <<'PY' \
       || die "cannot verify index operation supervisor"
 import fcntl
-import errno
 import os
 import stat
 import sys
@@ -739,14 +752,7 @@ try:
     if (provided.st_dev, provided.st_ino) != (expected.st_dev, expected.st_ino):
         raise OSError("index descriptor does not match selected state area")
     if mode == "write":
-        try:
-            fcntl.flock(expected_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EAGAIN):
-                raise
-        else:
-            fcntl.flock(expected_fd, fcntl.LOCK_UN)
-            raise OSError("index supervisor does not hold the operation lock")
+        fcntl.flock(fd, fcntl.LOCK_EX)
 finally:
     os.close(expected_fd)
 PY
@@ -755,18 +761,19 @@ PY
   if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}${FM_KNOWLEDGE_INDEX_SUPERVISOR_PID:-}${FM_KNOWLEDGE_INDEX_CONTROL_FD:-}${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" ]; then
     die "refusing unverified index supervisor environment"
   fi
-  env -u FM_KNOWLEDGE_INDEX_DIR_FD \
+  env -u INDEX_LOCATOR \
+    -u FM_KNOWLEDGE_INDEX_DIR_FD \
     -u FM_KNOWLEDGE_INDEX_SUPERVISED \
     -u FM_KNOWLEDGE_INDEX_SUPERVISOR_PID \
     -u FM_KNOWLEDGE_INDEX_CONTROL_FD \
-    python3 - "$INDEX_LOCATOR" "$mode" "$SCRIPT_DIR/$(basename "$0")" "${ORIGINAL_ARGS[@]}" <<'PY'
+    python3 - "$INDEX_LOCATOR" "$CONFIG" "$mode" "$SCRIPT_DIR/$(basename "$0")" "${ORIGINAL_ARGS[@]}" <<'PY'
 import fcntl
 import os
 import stat
 import subprocess
 import sys
 
-index_dir, mode, script, *arguments = sys.argv[1:]
+index_dir, config_dir, mode, script, *arguments = sys.argv[1:]
 fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
     for part in index_dir.split("/")[1:]:
@@ -798,6 +805,8 @@ try:
     environment["FM_KNOWLEDGE_INDEX_SUPERVISED"] = "1"
     environment["FM_KNOWLEDGE_INDEX_SUPERVISOR_PID"] = str(os.getpid())
     environment["FM_KNOWLEDGE_INDEX_CONTROL_FD"] = str(control_read)
+    environment["FM_STATE_OVERRIDE"] = os.path.dirname(index_dir)
+    environment["FM_CONFIG_OVERRIDE"] = config_dir
     environment["INDEX_LOCATOR"] = index_dir
     environment["INDEX_DIR"] = "."
     completed = subprocess.run(
@@ -805,11 +814,33 @@ try:
         env=environment,
         pass_fds=(fd, control_read),
         preexec_fn=lambda: os.fchdir(fd),
+        stdout=subprocess.PIPE,
         check=False,
     )
+    locator_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in index_dir.split("/")[1:]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=locator_fd,
+            )
+            os.close(locator_fd)
+            locator_fd = next_fd
+        locator = os.fstat(locator_fd)
+        stable = os.fstat(fd)
+        locator_matches = (locator.st_dev, locator.st_ino) == (stable.st_dev, stable.st_ino)
+    except OSError:
+        locator_matches = False
+    finally:
+        os.close(locator_fd)
     os.close(control_read)
     os.close(control_write)
-    sys.exit(completed.returncode)
+    if locator_matches:
+        sys.stdout.buffer.write(completed.stdout)
+        sys.stdout.buffer.flush()
+        sys.exit(completed.returncode)
+    sys.exit(completed.returncode or 1)
 finally:
     os.close(fd)
 PY

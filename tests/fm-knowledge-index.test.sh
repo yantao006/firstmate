@@ -408,6 +408,42 @@ test_forged_index_directory_fd_is_rejected() {
   pass "index descriptor injection without a supervisor lock is rejected"
 }
 
+test_index_locator_environment_is_ignored() {
+  local outside="$TMP_ROOT/outside-indexes" out
+  mkdir -p "$outside"
+  INDEX_LOCATOR="$outside" FM_HOME="$HOME_DIR" \
+    "$CLI" sync --source repo-a --json >/dev/null
+  [ ! -e "$outside/repo-a.sqlite3" ] \
+    || fail "caller INDEX_LOCATOR redirected index storage"
+  out=$(INDEX_LOCATOR="$outside" FM_HOME="$HOME_DIR" \
+    "$CLI" status --source repo-a --json)
+  [ "$(printf '%s' "$out" | jq -r '.database')" = "$HOME_DIR/state/knowledge-indexes/repo-a.sqlite3" ] \
+    || fail "caller INDEX_LOCATOR changed database provenance"
+  pass "index locator is derived from the selected state area"
+}
+
+test_relative_home_resolves_from_invocation_directory() {
+  local relative_parent="$TMP_ROOT/relative-parent" relative_home="home" source_root
+  local out
+  source_root="$FIXTURES/public"
+  mkdir -p "$relative_parent/$relative_home/config"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"relative",root:$root,owner:"Relative Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$relative_parent/$relative_home/config/knowledge-sources.json"
+  (
+    cd "$relative_parent"
+    FM_HOME="$relative_home" "$CLI" sync --source relative --json >/dev/null
+  )
+  out=$(
+    cd "$relative_parent"
+    FM_HOME="$relative_home" "$CLI" status --source relative --json
+  )
+  [ "$(printf '%s' "$out" | jq -r '.database')" = "$relative_parent/$relative_home/state/knowledge-indexes/relative.sqlite3" ] \
+    || fail "relative FM_HOME resolved against the supervised child directory"
+  pass "relative Firstmate home remains bound to the invocation directory"
+}
+
 test_registry_path_traversal_and_root_rejection() {
   local invalid_home="$TMP_ROOT/invalid-home" invalid_registry="$TMP_ROOT/invalid-home/config/knowledge-sources.json"
   mkdir -p "$invalid_home/config"
@@ -748,9 +784,9 @@ test_remove_replacement_preserves_replacement_database() {
   pass "exact removal preserves a concurrently replaced database"
 }
 
-test_status_stays_bound_during_index_directory_replacement() {
+test_status_fails_closed_during_index_directory_replacement() {
   local gate="$TMP_ROOT/status-directory-race" index_dir="$HOME_DIR/state/knowledge-indexes"
-  local detached="$HOME_DIR/state/knowledge-indexes.detached-status" status_pid out
+  local detached="$HOME_DIR/state/knowledge-indexes.detached-status" status_pid
   run_cli sync --source fleet --json >/dev/null
   FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_DATABASE_OPEN="$gate" \
     "$CLI" status --source fleet --json > "$TMP_ROOT/status-directory-race.out" 2>&1 &
@@ -762,15 +798,16 @@ test_status_stays_bound_during_index_directory_replacement() {
   mv "$index_dir" "$detached"
   mkdir -m 700 "$index_dir"
   : > "$gate.release"
-  wait "$status_pid" || fail "status lost its stable index directory binding"
-  out=$(cat "$TMP_ROOT/status-directory-race.out")
-  [ "$(printf '%s' "$out" | jq -r '.source')" = fleet ] \
-    || fail "status read replacement-directory content"
+  if wait "$status_pid"; then
+    fail "status reported success after index locator replacement"
+  fi
+  [ ! -s "$TMP_ROOT/status-directory-race.out" ] \
+    || fail "status emitted a success payload before locator verification"
   [ -z "$(find "$index_dir" -mindepth 1 -print -quit)" ] \
     || fail "status wrote temporary data through the replacement locator"
   rmdir "$index_dir"
   mv "$detached" "$index_dir"
-  pass "status remains bound to the opened index directory"
+  pass "status fails closed after index locator replacement"
 }
 
 test_fts5_diagnostic() {
@@ -803,6 +840,8 @@ test_sync_remove_source_coordination
 test_source_operation_lock_rejects_symlink
 test_bash_32_parse_compatibility
 test_forged_index_directory_fd_is_rejected
+test_index_locator_environment_is_ignored
+test_relative_home_resolves_from_invocation_directory
 test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
 test_root_replacement_rejects_stale_provenance
@@ -812,5 +851,5 @@ test_registry_replacement_preserves_previous_index
 test_bare_repository_has_no_commit_provenance
 test_post_verify_replacement_fails_closed
 test_remove_replacement_preserves_replacement_database
-test_status_stays_bound_during_index_directory_replacement
+test_status_fails_closed_during_index_directory_replacement
 test_fts5_diagnostic
