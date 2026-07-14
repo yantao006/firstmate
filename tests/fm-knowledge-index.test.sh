@@ -394,20 +394,18 @@ test_bash_32_parse_compatibility() {
 }
 
 test_forged_index_directory_fd_is_rejected() {
-  local foreign_dir="$TMP_ROOT/foreign-index-directory" out
-  mkdir -p "$foreign_dir"
-  exec 9< "$foreign_dir"
+  local index_dir="$HOME_DIR/state/knowledge-indexes" out
+  mkdir -p "$index_dir"
+  exec 9< "$index_dir"
   if out=$(FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_DIR_FD=9 \
     "$CLI" sync --source repo-b --json 2>&1); then
     exec 9<&-
     fail "sync accepted a forged index directory descriptor"
   fi
   exec 9<&-
-  assert_contains "$out" 'cannot acquire source operation lock for repo-b' \
+  assert_contains "$out" 'refusing unverified index supervisor environment' \
     "forged index directory descriptor failure was not reported"
-  [ ! -e "$foreign_dir/repo-b.sqlite3" ] \
-    || fail "forged index directory descriptor received a database"
-  pass "inherited index descriptor must match the selected state area"
+  pass "index descriptor injection without a supervisor lock is rejected"
 }
 
 test_registry_path_traversal_and_root_rejection() {
@@ -695,24 +693,18 @@ test_bare_repository_has_no_commit_provenance() {
   pass "bare repositories do not report worktree commit provenance"
 }
 
-test_post_verify_replacement_keeps_identity_provenance() {
+test_post_verify_replacement_fails_closed() {
   local race_home="$TMP_ROOT/publish-race-home" race_parent="$FIXTURES/publish-race-parent"
-  local race_root="$race_parent/source" replacement="$FIXTURES/publish-race-replacement"
-  local gate="$TMP_ROOT/publish-race-verified" sync_pid original_device original_inode out
-  local registry registry_device registry_inode registry_sha replacement_registry status
-  mkdir -p "$race_home/config" "$race_root/records" "$replacement/records"
+  local race_root="$race_parent/source"
+  local gate="$TMP_ROOT/publish-race-verified" sync_pid index_dir
+  local registry
+  mkdir -p "$race_home/config" "$race_root/records"
   printf '# Original\npublishidentityoriginalcanary\n' > "$race_root/records/race.md"
-  printf '# Replacement\npublishidentityreplacementcanary\n' > "$replacement/records/race.md"
-  original_device=$(stat -f '%d' "$race_root" 2>/dev/null || stat -c '%d' "$race_root")
-  original_inode=$(stat -f '%i' "$race_root" 2>/dev/null || stat -c '%i' "$race_root")
   registry="$race_home/config/knowledge-sources.json"
   jq -n --arg root "$race_root" \
     '{schema:"firstmate.knowledge-sources.v1",sources:[
       {id:"publish-race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
     ]}' > "$registry"
-  registry_device=$(stat -f '%d' "$registry" 2>/dev/null || stat -c '%d' "$registry")
-  registry_inode=$(stat -f '%i' "$registry" 2>/dev/null || stat -c '%i' "$registry")
-  registry_sha=$(sha_of "$registry")
   FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_PUBLICATION_VERIFY="$gate" \
     "$CLI" sync --source publish-race --json > "$TMP_ROOT/publish-race-sync.out" 2>&1 &
   sync_pid=$!
@@ -720,35 +712,65 @@ test_post_verify_replacement_keeps_identity_provenance() {
     kill -0 "$sync_pid" 2>/dev/null || fail "publish race sync exited before identity verification"
     sleep 0.01
   done
-  mv "$race_parent" "$FIXTURES/publish-race-parent-original"
-  mkdir -p "$race_parent"
-  cp -R "$replacement" "$race_root"
-  replacement_registry="$race_home/config/knowledge-sources.replacement.json"
-  jq -n --arg root "$race_root" \
-    '{schema:"firstmate.knowledge-sources.v1",sources:[
-      {id:"publish-race",root:$root,owner:"Replacement Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
-    ]}' > "$replacement_registry"
-  mv "$replacement_registry" "$registry"
+  index_dir="$race_home/state/knowledge-indexes"
+  mv "$index_dir" "$race_home/state/knowledge-indexes.detached"
+  mkdir -m 700 "$index_dir"
   : > "$gate.release"
-  wait "$sync_pid" || fail "publish race failed despite stable opened-root provenance"
-  out=$(FM_HOME="$race_home" "$CLI" search --source publish-race --query publishidentityoriginalcanary --json)
-  assert_result_count "$out" 1 "publish race lost content from the opened root"
-  [ "$(printf '%s' "$out" | jq -r '.results[0].source_root_device')" = "$original_device" ] \
-    || fail "publish race reported the replacement root device"
-  [ "$(printf '%s' "$out" | jq -r '.results[0].source_root_inode')" = "$original_inode" ] \
-    || fail "publish race reported the replacement root inode"
-  out=$(FM_HOME="$race_home" "$CLI" search --source publish-race --query publishidentityreplacementcanary --json)
-  assert_result_count "$out" 0 "publish race indexed replacement-root content"
-  status=$(FM_HOME="$race_home" "$CLI" status --source publish-race --json)
-  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_device')" = "$registry_device" ] \
-    || fail "publish race reported the replacement registry device"
-  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_inode')" = "$registry_inode" ] \
-    || fail "publish race reported the replacement registry inode"
-  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_sha256')" = "$registry_sha" ] \
-    || fail "publish race reported replacement registry content"
-  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_locator')" = "$registry" ] \
-    || fail "publish race lost the registry snapshot locator"
-  pass "publication records actual source and registry snapshot provenance"
+  if wait "$sync_pid"; then
+    fail "sync published after its source and index locator were replaced"
+  fi
+  [ ! -e "$race_home/state/knowledge-indexes/publish-race.sqlite3" ] \
+    || fail "failed locator race published a database"
+  pass "publication fails closed after locator replacement"
+}
+
+test_remove_replacement_preserves_replacement_database() {
+  local gate="$TMP_ROOT/remove-race" db="$HOME_DIR/state/knowledge-indexes/repo-a.sqlite3"
+  local original="$TMP_ROOT/repo-a-original.sqlite3" remove_pid replacement_sha
+  run_cli sync --source repo-a --json >/dev/null
+  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_REMOVE_VERIFY="$gate" \
+    "$CLI" remove --source repo-a --confirm repo-a --json > "$TMP_ROOT/remove-race.out" 2>&1 &
+  remove_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$remove_pid" 2>/dev/null || fail "remove exited before pathname replacement gate"
+    sleep 0.01
+  done
+  mv "$db" "$original"
+  cp "$original" "$db"
+  replacement_sha=$(sha_of "$db")
+  : > "$gate.release"
+  if wait "$remove_pid"; then
+    fail "remove accepted a database pathname replacement"
+  fi
+  [ -f "$db" ] || fail "remove deleted the replacement database"
+  [ "$(sha_of "$db")" = "$replacement_sha" ] \
+    || fail "remove changed the replacement database"
+  pass "exact removal preserves a concurrently replaced database"
+}
+
+test_status_stays_bound_during_index_directory_replacement() {
+  local gate="$TMP_ROOT/status-directory-race" index_dir="$HOME_DIR/state/knowledge-indexes"
+  local detached="$HOME_DIR/state/knowledge-indexes.detached-status" status_pid out
+  run_cli sync --source fleet --json >/dev/null
+  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_DATABASE_OPEN="$gate" \
+    "$CLI" status --source fleet --json > "$TMP_ROOT/status-directory-race.out" 2>&1 &
+  status_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$status_pid" 2>/dev/null || fail "status exited before directory replacement gate"
+    sleep 0.01
+  done
+  mv "$index_dir" "$detached"
+  mkdir -m 700 "$index_dir"
+  : > "$gate.release"
+  wait "$status_pid" || fail "status lost its stable index directory binding"
+  out=$(cat "$TMP_ROOT/status-directory-race.out")
+  [ "$(printf '%s' "$out" | jq -r '.source')" = fleet ] \
+    || fail "status read replacement-directory content"
+  [ -z "$(find "$index_dir" -mindepth 1 -print -quit)" ] \
+    || fail "status wrote temporary data through the replacement locator"
+  rmdir "$index_dir"
+  mv "$detached" "$index_dir"
+  pass "status remains bound to the opened index directory"
 }
 
 test_fts5_diagnostic() {
@@ -788,5 +810,7 @@ test_commit_provenance_uses_opened_root
 test_commit_provenance_ignores_git_environment_routing
 test_registry_replacement_preserves_previous_index
 test_bare_repository_has_no_commit_provenance
-test_post_verify_replacement_keeps_identity_provenance
+test_post_verify_replacement_fails_closed
+test_remove_replacement_preserves_replacement_database
+test_status_stays_bound_during_index_directory_replacement
 test_fts5_diagnostic

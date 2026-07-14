@@ -128,7 +128,9 @@ When several sources are explicitly named, each database is opened independently
 The per-source limit is between 1 and 100 and defaults to 20.
 
 `sync` always builds a complete new database in the index directory and atomically renames it over the old database only after integrity checks pass.
-Sync and removal open the index directory from the filesystem root one component at a time without following symlinks, retain that directory descriptor for the operation, and perform publication and deletion relative to it.
+Every database command is launched by a Python supervisor that opens the selected index directory from the filesystem root one component at a time without following symlinks and retains that stable directory descriptor until the command finishes.
+Sync and removal additionally retain an exclusive lock on that directory descriptor for the full child lifetime.
+Child commands reject inherited internal descriptors unless their parent is the live supervisor, its control pipe remains open, the descriptor matches the selected locator, and mutating commands can prove the supervisor still holds the directory lock.
 The database rename is the publication linearization point.
 The published database permanently identifies the exact source directory and registry snapshot used to build it, even if either current pathname is replaced after its final best-effort locator check.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
@@ -136,10 +138,12 @@ Complete rebuild semantics deterministically propagate canonical deletion, renam
 Repeated unchanged sync produces one row per current relative path and cannot accumulate duplicates.
 Sync and removal serialize on an exclusive lock on the stable opened index-directory descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
 This deliberately serializes different sources as well as the same source in exchange for avoiding replaceable pathname lock anchors and retaining Bash 3.2 compatibility.
-If a same-owner process renames the index directory while an operation is active, that operation remains bound to the original directory inode and cannot publish into the replacement pathname.
+Search and status create private snapshots relative to the stable descriptor, so replacing the index locator cannot redirect their reads or temporary writes.
+Sync and removal reopen the locator without following symlinks immediately before publication or deletion and fail closed if it no longer identifies the stable directory.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
-It removes only that source's exact disposable SQLite file.
+It quarantines the selected database with an atomic same-directory rename, verifies that the quarantined inode is the exact previously opened object, and only then unlinks it.
+If the pathname was replaced during validation, removal preserves the replacement and fails closed.
 It never changes the registry, canonical root, or any other source database.
 
 `--json` emits stable schema names, field names, ordering, and JSON types for automation.
@@ -154,7 +158,7 @@ Negative synthetic tests verify zero foreign-source canary leakage across exact,
 This is local process isolation, not operating-system identity authorization.
 Any process running as the same owner that can read `state/knowledge-indexes/` can directly open every database.
 Search and status atomically open the selected database without following symlinks, verify the same descriptor is a regular file, and query a private stable copy so a pathname replacement cannot redirect SQLite.
-POSIX does not prevent a malicious process running as the same owner from renaming directories or deleting files, so these mechanisms provide fail-closed CLI behavior and operation ordering, not protection against a hostile same-owner process.
+POSIX does not prevent a malicious process running as the same owner from renaming directories, deleting files, or directly bypassing this CLI, so these mechanisms provide fail-closed CLI linearization and operation ordering, not authorization against a hostile same-owner process.
 The boundary does not protect a compromised owner account, malicious canonical Markdown, terminal scrollback, backups, or an operator who explicitly selects a source they are allowed to read at the filesystem layer.
 
 C1 intentionally excludes semantic search, embeddings, code indexing, automatic capture, migration of existing content, background services, hooks, watchers, network listeners, cloud providers, credentials, and MCP.

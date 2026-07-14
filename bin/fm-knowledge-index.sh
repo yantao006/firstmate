@@ -19,7 +19,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 REGISTRY="$CONFIG/knowledge-sources.json"
-INDEX_DIR="$STATE/knowledge-indexes"
+INDEX_LOCATOR="${INDEX_LOCATOR:-$STATE/knowledge-indexes}"
+if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
+  INDEX_DIR=.
+else
+  INDEX_DIR=$INDEX_LOCATOR
+fi
 REGISTRY_SCHEMA="firstmate.knowledge-sources.v1"
 JSON=0
 TEMP_FILES=()
@@ -438,6 +443,7 @@ import json
 import os
 import stat
 import sys
+import time
 
 path, snapshot, identity = sys.argv[1:]
 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -581,6 +587,22 @@ try:
     try:
         temporary_name = os.path.basename(temporary)
         destination_name = os.path.basename(destination)
+        locator_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in os.environ["INDEX_LOCATOR"].split("/")[1:]:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=locator_fd,
+                )
+                os.close(locator_fd)
+                locator_fd = next_fd
+            locator = os.fstat(locator_fd)
+            stable = os.fstat(index_fd)
+            if (locator.st_dev, locator.st_ino) != (stable.st_dev, stable.st_ino):
+                raise OSError("index directory locator changed before publication")
+        finally:
+            os.close(locator_fd)
         temporary_fd = os.open(
             temporary_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=index_fd
         )
@@ -654,8 +676,8 @@ safe_relative_path() {
 }
 
 ensure_index_dir() {
-  if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}" ]; then
-    INDEX_DIR=$INDEX_DIR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" <<'PY' \
+  if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
+    python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" <<'PY' \
       || die "cannot access stable index directory: $INDEX_DIR"
 import os
 import stat
@@ -665,21 +687,6 @@ fd = int(sys.argv[1])
 provided = os.fstat(fd)
 if not stat.S_ISDIR(provided.st_mode):
     raise OSError("index descriptor is not a directory")
-expected_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-try:
-    for part in os.environ["INDEX_DIR"].split("/")[1:]:
-        next_fd = os.open(
-            part,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=expected_fd,
-        )
-        os.close(expected_fd)
-        expected_fd = next_fd
-    expected = os.fstat(expected_fd)
-    if (provided.st_dev, provided.st_ino) != (expected.st_dev, expected.st_ino):
-        raise OSError("index descriptor does not match selected state area")
-finally:
-    os.close(expected_fd)
 os.fchmod(fd, 0o700)
 PY
     return
@@ -691,26 +698,36 @@ PY
 }
 
 database_path() {
-  printf '%s/%s.sqlite3\n' "$INDEX_DIR" "$1"
+  printf '%s/%s.sqlite3\n' "$INDEX_LOCATOR" "$1"
 }
 
-coordinate_source_operation() {
-  local id=$1
-  if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}" ]; then
-    INDEX_DIR=$INDEX_DIR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" <<'PY' \
-      || die "cannot acquire source operation lock for $id"
+coordinate_index_operation() {
+  local mode=$1
+  if [ "${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" = 1 ]; then
+    [ "$PPID" -eq "$FM_KNOWLEDGE_INDEX_SUPERVISOR_PID" ] \
+      || die "cannot verify index operation supervisor"
+    INDEX_LOCATOR=$INDEX_LOCATOR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" "$$" "$FM_KNOWLEDGE_INDEX_CONTROL_FD" "$mode" <<'PY' \
+      || die "cannot verify index operation supervisor"
 import fcntl
+import errno
 import os
 import stat
 import sys
 
 fd = int(sys.argv[1])
+supervisor_pid = int(sys.argv[2])
+control_fd = int(sys.argv[3])
+mode = sys.argv[4]
+if os.getppid() != supervisor_pid:
+    raise OSError("index supervisor identity mismatch")
+if not stat.S_ISFIFO(os.fstat(control_fd).st_mode):
+    raise OSError("index supervisor control descriptor is invalid")
 provided = os.fstat(fd)
 if not stat.S_ISDIR(provided.st_mode):
     raise OSError("index descriptor is not a directory")
 expected_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
-    for part in os.environ["INDEX_DIR"].split("/")[1:]:
+    for part in os.environ["INDEX_LOCATOR"].split("/")[1:]:
         next_fd = os.open(
             part,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -721,20 +738,35 @@ try:
     expected = os.fstat(expected_fd)
     if (provided.st_dev, provided.st_ino) != (expected.st_dev, expected.st_ino):
         raise OSError("index descriptor does not match selected state area")
+    if mode == "write":
+        try:
+            fcntl.flock(expected_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+        else:
+            fcntl.flock(expected_fd, fcntl.LOCK_UN)
+            raise OSError("index supervisor does not hold the operation lock")
 finally:
     os.close(expected_fd)
-fcntl.flock(fd, fcntl.LOCK_EX)
 PY
     return
   fi
-  python3 - "$INDEX_DIR" "$0" "${ORIGINAL_ARGS[@]}" <<'PY'
+  if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}${FM_KNOWLEDGE_INDEX_SUPERVISOR_PID:-}${FM_KNOWLEDGE_INDEX_CONTROL_FD:-}${FM_KNOWLEDGE_INDEX_SUPERVISED:-}" ]; then
+    die "refusing unverified index supervisor environment"
+  fi
+  env -u FM_KNOWLEDGE_INDEX_DIR_FD \
+    -u FM_KNOWLEDGE_INDEX_SUPERVISED \
+    -u FM_KNOWLEDGE_INDEX_SUPERVISOR_PID \
+    -u FM_KNOWLEDGE_INDEX_CONTROL_FD \
+    python3 - "$INDEX_LOCATOR" "$mode" "$SCRIPT_DIR/$(basename "$0")" "${ORIGINAL_ARGS[@]}" <<'PY'
 import fcntl
 import os
 import stat
 import subprocess
 import sys
 
-index_dir, script, *arguments = sys.argv[1:]
+index_dir, mode, script, *arguments = sys.argv[1:]
 fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
     for part in index_dir.split("/")[1:]:
@@ -756,16 +788,27 @@ try:
     if not stat.S_ISDIR(os.fstat(fd).st_mode):
         raise OSError("index path is not a directory")
     os.fchmod(fd, 0o700)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    if mode == "write":
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    control_read, control_write = os.pipe()
     os.set_inheritable(fd, True)
+    os.set_inheritable(control_read, True)
     environment = os.environ.copy()
     environment["FM_KNOWLEDGE_INDEX_DIR_FD"] = str(fd)
+    environment["FM_KNOWLEDGE_INDEX_SUPERVISED"] = "1"
+    environment["FM_KNOWLEDGE_INDEX_SUPERVISOR_PID"] = str(os.getpid())
+    environment["FM_KNOWLEDGE_INDEX_CONTROL_FD"] = str(control_read)
+    environment["INDEX_LOCATOR"] = index_dir
+    environment["INDEX_DIR"] = "."
     completed = subprocess.run(
         [script] + arguments,
         env=environment,
-        pass_fds=(fd,),
+        pass_fds=(fd, control_read),
+        preexec_fn=lambda: os.fchdir(fd),
         check=False,
     )
+    os.close(control_read)
+    os.close(control_write)
     sys.exit(completed.returncode)
 finally:
     os.close(fd)
@@ -777,28 +820,30 @@ validate_database() {
   local id=$1 db=$2 stable_db stored integrity
   stable_db=$(mktemp "$INDEX_DIR/.knowledge-database-snapshot.XXXXXX")
   TEMP_FILES+=("$stable_db")
-  python3 - "$INDEX_DIR" "$id.sqlite3" "$stable_db" <<'PY' \
+  python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" "$id.sqlite3" "$(basename "$stable_db")" <<'PY' \
     || die "index not found or unsafe for $id; run sync --source $id"
 import os
 import stat
 import sys
+import time
 
-directory, name, snapshot = sys.argv[1:]
-directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+directory_fd = os.dup(int(sys.argv[1]))
+name, snapshot = sys.argv[2:]
 try:
-    for part in directory.split("/")[1:]:
-        next_fd = os.open(
-            part,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=directory_fd,
-        )
-        os.close(directory_fd)
-        directory_fd = next_fd
     source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
     try:
         if not stat.S_ISREG(os.fstat(source_fd).st_mode):
             raise OSError("database is not regular")
-        destination_fd = os.open(snapshot, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_DATABASE_OPEN")
+        if gate:
+            open(gate + ".ready", "w", encoding="utf-8").close()
+            while not os.path.exists(gate + ".release"):
+                time.sleep(0.01)
+        destination_fd = os.open(
+            snapshot,
+            os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
         try:
             while True:
                 chunk = os.read(source_fd, 1024 * 1024)
@@ -1050,18 +1095,18 @@ SQL
       sleep 0.01
     done
   fi
-  db=$(database_path "$id")
+  db="$id.sqlite3"
   verify_registry_identity "$original_registry" "$registry_identity" \
     || die "registry changed before publishing $id; previous index preserved"
   publish_database "$root" "$root_identity" "$original_registry" "$registry_identity" "$tmp_db" "$db" \
     || die "source root changed before publishing $id; previous index preserved"
   if [ "$JSON" -eq 1 ]; then
     jq -cn \
-      --arg source "$id" --arg database "$db" --arg indexed_at "$indexed_at" \
+      --arg source "$id" --arg database "$(database_path "$id")" --arg indexed_at "$indexed_at" \
       --argjson documents "$count" \
       '{schema:"fm-knowledge-index.sync.v1",source:$source,database:$database,documents:$documents,indexed_at:$indexed_at}'
   else
-    printf 'synced %s: %s documents -> %s\n' "$id" "$count" "$db"
+    printf 'synced %s: %s documents -> %s\n' "$id" "$count" "$(database_path "$id")"
   fi
 }
 
@@ -1104,7 +1149,7 @@ command_search() {
       [ "$seen_id" != "$id" ] || die "duplicate selected source: $id"
     done
     seen+=("$id")
-    db=$(database_path "$id")
+    db="$id.sqlite3"
     validate_database "$id" "$db"
     db=$VALIDATED_DATABASE
     query_sql=${query_file//\'/\'\'}
@@ -1160,8 +1205,8 @@ command_status() {
   local id=$1 db database_locator metadata bytes documents payload
   validate_registry_structure
   validate_source_id "$id"
-  db=$(database_path "$id")
-  database_locator=$db
+  db="$id.sqlite3"
+  database_locator=$(database_path "$id")
   validate_database "$id" "$db"
   db=$VALIDATED_DATABASE
   metadata=$(sqlite3 -readonly -json "$db" \
@@ -1203,37 +1248,66 @@ command_remove() {
   [ "$confirm" = "$id" ] \
     || die "removal requires --confirm $id"
   db=$(database_path "$id")
-  removed=$(python3 - "$INDEX_DIR" "$id.sqlite3" <<'PY'
+  removed=$(python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" "$id.sqlite3" <<'PY'
 import os
+import secrets
 import stat
 import sys
+import time
 
-directory, name = sys.argv[1:]
-fd_value = os.environ.get("FM_KNOWLEDGE_INDEX_DIR_FD")
-if fd_value:
-    directory_fd = os.dup(int(fd_value))
-else:
-    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    for part in directory.split("/")[1:]:
-        next_fd = os.open(
-            part,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=directory_fd,
-        )
-        os.close(directory_fd)
-        directory_fd = next_fd
+directory_fd = os.dup(int(sys.argv[1]))
+name = sys.argv[2]
 try:
+    locator_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in os.environ["INDEX_LOCATOR"].split("/")[1:]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=locator_fd,
+            )
+            os.close(locator_fd)
+            locator_fd = next_fd
+        locator = os.fstat(locator_fd)
+        stable = os.fstat(directory_fd)
+        if (locator.st_dev, locator.st_ino) != (stable.st_dev, stable.st_ino):
+            raise OSError("index directory locator changed before removal")
+    finally:
+        os.close(locator_fd)
     try:
         target_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
     except FileNotFoundError:
         print("false")
     else:
         try:
-            if not stat.S_ISREG(os.fstat(target_fd).st_mode):
+            expected = os.fstat(target_fd)
+            if not stat.S_ISREG(expected.st_mode):
                 raise OSError("database is not regular")
         finally:
             os.close(target_fd)
-        os.unlink(name, dir_fd=directory_fd)
+        gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_REMOVE_VERIFY")
+        if gate:
+            open(gate + ".ready", "w", encoding="utf-8").close()
+            while not os.path.exists(gate + ".release"):
+                time.sleep(0.01)
+        quarantine = ".remove-%s-%s" % (name, secrets.token_hex(12))
+        os.rename(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        quarantine_fd = os.open(
+            quarantine, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd
+        )
+        try:
+            actual = os.fstat(quarantine_fd)
+        finally:
+            os.close(quarantine_fd)
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            try:
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.rename(
+                    quarantine, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+                )
+            raise OSError("database changed during exact removal")
+        os.unlink(quarantine, dir_fd=directory_fd)
         print("true")
 finally:
     os.close(directory_fd)
@@ -1294,17 +1368,19 @@ case "$COMMAND" in
       || die "sync requires exactly one --source and accepts only --json otherwise"
     validate_registry_structure
     validate_source_id "${SOURCES[0]}"
-    coordinate_source_operation "${SOURCES[0]}"
+    coordinate_index_operation write
     command_sync "${SOURCES[0]}"
     ;;
   search)
     [ "${#SOURCES[@]}" -gt 0 ] && [ -n "$QUERY" ] && [ -z "$CONFIRM" ] \
       || die "search requires explicit --source and --query"
+    coordinate_index_operation read
     command_search "$QUERY" "$LIMIT" "${SOURCES[@]}"
     ;;
   status)
     [ "${#SOURCES[@]}" -eq 1 ] && [ -z "$QUERY$CONFIRM" ] && [ "$LIMIT" -eq 20 ] \
       || die "status requires exactly one --source and accepts only --json otherwise"
+    coordinate_index_operation read
     command_status "${SOURCES[0]}"
     ;;
   remove)
@@ -1312,7 +1388,7 @@ case "$COMMAND" in
       || die "remove requires exactly one --source and --confirm"
     validate_registry_structure
     validate_source_id "${SOURCES[0]}"
-    coordinate_source_operation "${SOURCES[0]}"
+    coordinate_index_operation write
     command_remove "${SOURCES[0]}" "$CONFIRM"
     ;;
   *) usage >&2; exit 2 ;;
