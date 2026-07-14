@@ -956,7 +956,7 @@ test_supervisor_rolls_back_post_verify_provenance_change() {
 }
 
 test_atomic_replace_never_removes_canonical_database() {
-  local gate="$TMP_ROOT/atomic-replace-gate" sync_pid index before after
+  local gate="$TMP_ROOT/atomic-replace-gate" sync_pid supervisor_pid index before after
   index="$HOME_DIR/state/knowledge-indexes/repo-a.sqlite3"
   run_cli sync --source repo-a --json >/dev/null
   before=$(sha_of "$index")
@@ -971,12 +971,44 @@ test_atomic_replace_never_removes_canonical_database() {
   [ -f "$index" ] || fail "canonical database disappeared before atomic replace"
   after=$(sha_of "$index")
   [ "$after" = "$before" ] || fail "canonical database changed before atomic replace"
-  kill -9 "$sync_pid" 2>/dev/null || true
+  supervisor_pid=$(pgrep -P "$sync_pid" | head -1)
+  [ -n "$supervisor_pid" ] || fail "could not identify sync supervisor for interruption"
+  kill -9 "$supervisor_pid" 2>/dev/null || true
   wait "$sync_pid" 2>/dev/null || true
   [ -f "$index" ] || fail "interrupted publish left no canonical database"
   after=$(sha_of "$index")
   [ "$after" = "$before" ] || fail "interrupted publish changed the canonical database"
+  run_cli status --source repo-a --json >/dev/null
+  if find "$HOME_DIR/state/knowledge-indexes/.transactions" -type f -name 'sync-repo-a.sqlite3' | grep -q .; then
+    fail "interrupted publish recovery reference survived the next locked operation"
+  fi
   pass "sync publication keeps the canonical database through interruption"
+}
+
+test_interrupted_remove_recovers_without_old_content_residue() {
+  local gate="$TMP_ROOT/interrupted-remove" remove_pid supervisor_pid index out
+  index="$HOME_DIR/state/knowledge-indexes/repo-b.sqlite3"
+  run_cli sync --source repo-b --json >/dev/null
+  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_REMOVE_QUARANTINE="$gate" \
+    "$CLI" remove --source repo-b --confirm repo-b --json > "$TMP_ROOT/interrupted-remove.out" 2>&1 &
+  remove_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$remove_pid" 2>/dev/null || fail "remove exited before quarantine interruption gate"
+    sleep 0.01
+  done
+  supervisor_pid=$(pgrep -P "$remove_pid" | head -1)
+  [ -n "$supervisor_pid" ] || fail "could not identify remove supervisor for interruption"
+  kill -9 "$supervisor_pid" 2>/dev/null || true
+  wait "$remove_pid" 2>/dev/null || true
+  [ ! -e "$index" ] || fail "interrupted remove did not quarantine the canonical database"
+  out=$(run_cli remove --source repo-b --confirm repo-b --json)
+  [ "$(printf '%s' "$out" | jq -r '.removed')" = true ] \
+    || fail "next locked remove did not recover and complete interrupted removal"
+  [ ! -e "$index" ] || fail "recovered removal left the canonical database"
+  if find "$HOME_DIR/state/knowledge-indexes/.transactions" -type f -name 'remove-repo-b.sqlite3' | grep -q .; then
+    fail "completed removal retained old index content in transaction recovery"
+  fi
+  pass "interrupted removal recovers and clears old index content"
 }
 
 test_fts5_diagnostic() {
@@ -1026,4 +1058,5 @@ test_unsafe_source_is_rejected_before_supervisor_file_access
 test_supervisor_revalidates_provenance_and_state_before_commit
 test_supervisor_rolls_back_post_verify_provenance_change
 test_atomic_replace_never_removes_canonical_database
+test_interrupted_remove_recovers_without_old_content_residue
 test_fts5_diagnostic

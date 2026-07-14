@@ -835,6 +835,41 @@ try:
         finally:
             os.close(current_index_fd)
 
+    def open_current_index():
+        current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in state_parts:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+            current = os.fstat(current_fd)
+            if (current.st_dev, current.st_ino) != (
+                state_identity.st_dev,
+                state_identity.st_ino,
+            ):
+                raise OSError("selected state locator changed")
+            next_fd = os.open(
+                "knowledge-indexes",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+            current = os.fstat(current_fd)
+            if (current.st_dev, current.st_ino) != (
+                index_identity.st_dev,
+                index_identity.st_ino,
+            ):
+                raise OSError("index locator changed")
+            return current_fd
+        except Exception:
+            os.close(current_fd)
+            raise
+
     os.fchmod(fd, 0o700)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
@@ -847,6 +882,52 @@ try:
         dir_fd=fd,
     )
     index_identity = os.fstat(index_fd)
+    try:
+        os.mkdir(".transactions", 0o700, dir_fd=index_fd)
+    except FileExistsError:
+        pass
+    transaction_fd = os.open(
+        ".transactions",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=index_fd,
+    )
+    transaction_identity = os.fstat(transaction_fd)
+
+    def open_current_transaction():
+        current_index_fd = open_current_index()
+        try:
+            current_transaction_fd = os.open(
+                ".transactions",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_index_fd,
+            )
+        finally:
+            os.close(current_index_fd)
+        current = os.fstat(current_transaction_fd)
+        if (current.st_dev, current.st_ino) != (
+            transaction_identity.st_dev,
+            transaction_identity.st_ino,
+        ):
+            os.close(current_transaction_fd)
+            raise OSError("transaction locator changed")
+        return current_transaction_fd
+    for transaction in os.listdir(transaction_fd):
+        if transaction.startswith("sync-") and transaction.endswith(".sqlite3"):
+            os.unlink(transaction, dir_fd=transaction_fd)
+        elif transaction.startswith("remove-") and transaction.endswith(".sqlite3"):
+            source = transaction[7:-8]
+            if source_pattern.fullmatch(source):
+                try:
+                    os.stat(source + ".sqlite3", dir_fd=index_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.rename(
+                        transaction,
+                        source + ".sqlite3",
+                        src_dir_fd=transaction_fd,
+                        dst_dir_fd=index_fd,
+                    )
+                    continue
+            os.unlink(transaction, dir_fd=transaction_fd)
     work_name = ".knowledge-operation-" + secrets.token_hex(12)
     os.mkdir(work_name, 0o700, dir_fd=fd)
     work_fd = os.open(
@@ -1000,14 +1081,14 @@ try:
                 time.sleep(0.01)
         revalidate_provenance()
         require_locators()
-        previous = ".previous-" + secrets.token_hex(12) + ".sqlite3"
+        previous = "sync-" + source + ".sqlite3"
         had_previous = True
         published = False
         try:
             try:
                 os.link(
-                    "knowledge-indexes/" + source + ".sqlite3", previous,
-                    src_dir_fd=fd, dst_dir_fd=fd,
+                    source + ".sqlite3", previous,
+                    src_dir_fd=index_fd, dst_dir_fd=transaction_fd,
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
@@ -1018,39 +1099,51 @@ try:
                 while not os.path.exists(gate + ".release"):
                     import time
                     time.sleep(0.01)
-            os.replace(
-                work_name + "/" + prepared,
-                "knowledge-indexes/" + source + ".sqlite3",
-                src_dir_fd=fd,
-                dst_dir_fd=fd,
-            )
+            commit_index_fd = open_current_index()
+            try:
+                os.replace(
+                    prepared,
+                    source + ".sqlite3",
+                    src_dir_fd=work_fd,
+                    dst_dir_fd=commit_index_fd,
+                )
+            finally:
+                os.close(commit_index_fd)
             published = True
             revalidate_provenance()
             require_locators()
         except Exception:
             if published:
                 if had_previous:
-                    os.replace(
-                        previous,
-                        "knowledge-indexes/" + source + ".sqlite3",
-                        src_dir_fd=fd,
-                        dst_dir_fd=fd,
-                    )
+                    rollback_index_fd = open_current_index()
+                    try:
+                        os.replace(
+                            previous,
+                            source + ".sqlite3",
+                            src_dir_fd=transaction_fd,
+                            dst_dir_fd=rollback_index_fd,
+                        )
+                    finally:
+                        os.close(rollback_index_fd)
                 else:
                     try:
-                        os.unlink("knowledge-indexes/" + source + ".sqlite3", dir_fd=fd)
+                        rollback_index_fd = open_current_index()
+                        try:
+                            os.unlink(source + ".sqlite3", dir_fd=rollback_index_fd)
+                        finally:
+                            os.close(rollback_index_fd)
                     except FileNotFoundError:
                         pass
             elif had_previous:
-                os.unlink(previous, dir_fd=fd)
+                os.unlink(previous, dir_fd=transaction_fd)
             raise
         if had_previous:
-            os.unlink(previous, dir_fd=fd)
+            os.unlink(previous, dir_fd=transaction_fd)
     elif completed.returncode == 0 and command == "remove":
         source = sources[0]
         require_locators()
         removal_staged = False
-        quarantine = ".knowledge-remove-" + secrets.token_hex(12) + ".sqlite3"
+        quarantine = "remove-" + source + ".sqlite3"
         try:
             target_fd = os.open(
                 source + ".sqlite3",
@@ -1069,24 +1162,34 @@ try:
                 while not os.path.exists(gate + ".release"):
                     import time
                     time.sleep(0.01)
-            os.rename(
-                "knowledge-indexes/" + source + ".sqlite3",
-                quarantine,
-                src_dir_fd=fd,
-                dst_dir_fd=fd,
-            )
+            commit_index_fd = open_current_index()
+            try:
+                os.rename(
+                    source + ".sqlite3",
+                    quarantine,
+                    src_dir_fd=commit_index_fd,
+                    dst_dir_fd=transaction_fd,
+                )
+            finally:
+                os.close(commit_index_fd)
         except FileNotFoundError:
             removed = False
         else:
             try:
-                actual = os.stat(quarantine, dir_fd=fd, follow_symlinks=False)
+                gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_REMOVE_QUARANTINE")
+                if gate:
+                    open(gate + ".ready", "w", encoding="utf-8").close()
+                    while not os.path.exists(gate + ".release"):
+                        import time
+                        time.sleep(0.01)
+                actual = os.stat(quarantine, dir_fd=transaction_fd, follow_symlinks=False)
                 if (actual.st_dev, actual.st_ino) != (
                     expected_target.st_dev,
                     expected_target.st_ino,
                 ):
                     raise OSError("database changed during exact removal")
                 validation_name = ".remove-validation.sqlite3"
-                source_fd = os.open(quarantine, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                source_fd = os.open(quarantine, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=transaction_fd)
                 destination_fd = os.open(
                     validation_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -1118,13 +1221,14 @@ try:
                 if stored != (source,):
                     raise OSError("database metadata mismatch")
                 require_locators()
-                os.rename(
-                    quarantine,
-                    work_name + "/" + quarantine,
-                    src_dir_fd=fd,
-                    dst_dir_fd=fd,
-                )
                 removal_staged = True
+                require_locators()
+                commit_transaction_fd = open_current_transaction()
+                try:
+                    os.unlink(quarantine, dir_fd=commit_transaction_fd)
+                finally:
+                    os.close(commit_transaction_fd)
+                removal_staged = False
                 require_locators()
                 removed = True
             except Exception:
@@ -1135,16 +1239,16 @@ try:
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
-                    staged_name = (
-                        work_name + "/" + quarantine
-                        if removal_staged else quarantine
-                    )
-                    os.rename(
-                        staged_name,
-                        "knowledge-indexes/" + source + ".sqlite3",
-                        src_dir_fd=fd,
-                        dst_dir_fd=fd,
-                    )
+                    restore_index_fd = open_current_index()
+                    try:
+                        os.rename(
+                            quarantine,
+                            source + ".sqlite3",
+                            src_dir_fd=transaction_fd,
+                            dst_dir_fd=restore_index_fd,
+                        )
+                    finally:
+                        os.close(restore_index_fd)
                 raise
         if "--json" in arguments:
             completed.stdout = (
@@ -1162,12 +1266,16 @@ try:
     except Exception:
         if command == "remove" and locals().get("removal_staged"):
             try:
-                os.rename(
-                    work_name + "/" + quarantine,
-                    "knowledge-indexes/" + source + ".sqlite3",
-                    src_dir_fd=fd,
-                    dst_dir_fd=fd,
-                )
+                restore_index_fd = open_current_index()
+                try:
+                    os.rename(
+                        quarantine,
+                        source + ".sqlite3",
+                        src_dir_fd=transaction_fd,
+                        dst_dir_fd=restore_index_fd,
+                    )
+                finally:
+                    os.close(restore_index_fd)
                 removal_staged = False
             except OSError:
                 pass
@@ -1189,7 +1297,7 @@ finally:
         shutil.rmtree(work_name)
     except (NameError, OSError):
         pass
-    for descriptor in (locals().get("work_fd"), locals().get("index_fd")):
+    for descriptor in (locals().get("work_fd"), locals().get("transaction_fd"), locals().get("index_fd")):
         if descriptor is not None:
             os.close(descriptor)
     for descriptor in locals().get("ancestor_fds", []):

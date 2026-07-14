@@ -138,6 +138,8 @@ The database replace is the publication linearization point.
 Immediately before committing a prepared database, the supervisor independently reopens and verifies the source-root device and inode plus the registry device, inode, and content digest recorded inside that database.
 Before replacement it creates a hard-link recovery reference to any previous database, then publishes with one atomic replace so the canonical pathname never has an intermediate absent state.
 It repeats those provenance and full locator-chain checks after replacement and restores the previous database if any check or replacement step fails.
+Recovery references live in the enumerable `.transactions` directory under the index locator.
+The next locked database operation deterministically removes interrupted sync references and restores interrupted removal quarantines before doing new work.
 The published database permanently identifies the exact source directory and registry snapshot accepted at that commit boundary.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
@@ -145,15 +147,17 @@ Repeated unchanged sync produces one row per current relative path and cannot ac
 Sync and removal serialize on an exclusive lock on the stable opened state-root descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
 This deliberately serializes different sources as well as the same source in exchange for avoiding replaceable pathname lock anchors and retaining Bash 3.2 compatibility.
 Search and status receive private snapshots created by the supervisor before the worker starts, so the worker never reads through a detached index directory.
-The supervisor retains descriptors and identities for every selected state ancestor from the filesystem root, buffers command output until the worker exits, verifies that the complete state and index locator chain still identifies the directories opened at operation start, performs any final state-root-relative commit, and releases output only after another successful locator check.
-Replacing the state or index directory during an operation cannot make the worker publish, read, or remove through the detached directory.
+The supervisor retains descriptors and identities for every selected state ancestor from the filesystem root, buffers command output until the worker exits, reopens and verifies the complete absolute state and index locator chain immediately around each commit, performs final commits through the freshly reopened index descriptor, and releases output only after another successful locator check.
+Replacing the state or index directory causes the CLI to fail closed whenever the replacement is observed at those commit checks.
 An actor with the same operating-system identity can construct equivalent descriptors, parent processes, and environment values or directly edit files in the selected state area, and is outside this filesystem isolation boundary.
 The supervisor protocol prevents accidental inherited environment from granting commit authority but is not an authentication boundary against a hostile process running as that identity.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
-It quarantines the selected database with an atomic same-directory rename, verifies that the quarantined inode is the exact previously opened object, and stages it in the private operation directory while the full state locator remains valid.
-If a locator check fails before successful completion, the supervisor restores the staged inode to the canonical pathname.
+It quarantines the selected database with an atomic rename into the enumerable transaction directory, verifies that the quarantined inode is the exact previously opened object, and keeps it recoverable while the full state locator remains valid.
+If the process stops before the removal commit, the next locked operation restores the quarantined inode before proceeding.
+If a locator check fails before successful completion, the supervisor restores the quarantined inode to the canonical pathname when the selected locator remains available.
 If the pathname was replaced during validation, removal preserves the replacement and fails closed.
+Successful removal explicitly unlinks the quarantine before reporting `removed=true`, so no old index content remains in the transaction directory.
 It never changes the registry, canonical root, or any other source database.
 
 `--json` emits stable schema names, field names, ordering, and JSON types for automation.
