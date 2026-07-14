@@ -254,11 +254,17 @@ try:
         saved_cwd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fchdir(directory_fd)
+            git_environment = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("GIT_")
+            }
             inside = subprocess.run(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                env=git_environment,
             )
             commit = ""
             if inside.returncode == 0:
@@ -268,6 +274,7 @@ try:
                     stderr=subprocess.DEVNULL,
                     check=False,
                     text=True,
+                    env=git_environment,
                 )
                 candidate = resolved.stdout.strip()
                 if resolved.returncode == 0 and candidate and all(

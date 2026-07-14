@@ -568,6 +568,36 @@ test_commit_provenance_uses_opened_root() {
   pass "commit provenance stays bound to the opened source root"
 }
 
+test_commit_provenance_ignores_git_environment_routing() {
+  local routed_home="$TMP_ROOT/git-routing-home" source_root="$FIXTURES/git-routing-source"
+  local outside_root="$FIXTURES/git-routing-outside" source_commit outside_commit out
+  mkdir -p "$routed_home/config" "$source_root/records" "$outside_root"
+  printf '# Source\ngitroutingsourcecanary\n' > "$source_root/records/source.md"
+  printf '# Outside\ngitroutingoutsidecanary\n' > "$outside_root/outside.md"
+  init_repo "$source_root"
+  init_repo "$outside_root"
+  source_commit=$(git -C "$source_root" rev-parse HEAD)
+  outside_commit=$(git -C "$outside_root" rev-parse HEAD)
+  [ "$source_commit" != "$outside_commit" ] || fail "synthetic routing commits unexpectedly match"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"git-routing",root:$root,owner:"Routing Owner",privacy:"repo-private",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$routed_home/config/knowledge-sources.json"
+  GIT_DIR="$outside_root/.git" GIT_WORK_TREE="$outside_root" \
+    GIT_COMMON_DIR="$outside_root/.git" GIT_INDEX_FILE="$outside_root/.git/index" \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    FM_HOME="$routed_home" "$CLI" sync --source git-routing --json >/dev/null
+  out=$(FM_HOME="$routed_home" "$CLI" search --source git-routing --query gitroutingsourcecanary --json)
+  assert_result_count "$out" 1 "Git routing environment changed indexed source content"
+  [ "$(printf '%s' "$out" | jq -r '.results[0].commit_sha')" = "$source_commit" ] \
+    || fail "Git routing environment forged commit provenance"
+  [ "$(printf '%s' "$out" | jq -r '.results[0].source_root')" = "$source_root" ] \
+    || fail "Git routing environment changed source-root provenance"
+  out=$(FM_HOME="$routed_home" "$CLI" search --source git-routing --query gitroutingoutsidecanary --json)
+  assert_result_count "$out" 0 "Git routing environment leaked outside repository content"
+  pass "commit provenance ignores caller Git repository routing"
+}
+
 test_post_verify_replacement_keeps_identity_provenance() {
   local race_home="$TMP_ROOT/publish-race-home" race_parent="$FIXTURES/publish-race-parent"
   local race_root="$race_parent/source" replacement="$FIXTURES/publish-race-replacement"
@@ -635,5 +665,6 @@ test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
 test_root_replacement_rejects_stale_provenance
 test_commit_provenance_uses_opened_root
+test_commit_provenance_ignores_git_environment_routing
 test_post_verify_replacement_keeps_identity_provenance
 test_fts5_diagnostic
