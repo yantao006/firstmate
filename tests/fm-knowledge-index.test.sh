@@ -374,6 +374,23 @@ test_sync_remove_source_coordination() {
   pass "source-scoped sync and remove coordination"
 }
 
+test_source_operation_lock_rejects_symlink() {
+  local lock_dir="$HOME_DIR/state/knowledge-indexes"
+  local lock_path="$lock_dir/.repo-b.operation.lock"
+  local foreign_lock="$TMP_ROOT/foreign-operation.lock" out
+  rm -f "$lock_path"
+  : > "$foreign_lock"
+  ln -s "$foreign_lock" "$lock_path"
+  if out=$(run_cli sync --source repo-b --json 2>&1); then
+    fail "source operation accepted a symlink lock"
+  fi
+  assert_contains "$out" 'cannot open source operation lock for repo-b' \
+    "symlink lock failure was not reported"
+  [ ! -s "$foreign_lock" ] || fail "source operation wrote through a symlink lock"
+  rm "$lock_path"
+  pass "source operation lock is atomically opened without following symlinks"
+}
+
 test_registry_path_traversal_and_root_rejection() {
   local invalid_home="$TMP_ROOT/invalid-home" invalid_registry="$TMP_ROOT/invalid-home/config/knowledge-sources.json"
   mkdir -p "$invalid_home/config"
@@ -663,16 +680,21 @@ test_post_verify_replacement_keeps_identity_provenance() {
   local race_home="$TMP_ROOT/publish-race-home" race_parent="$FIXTURES/publish-race-parent"
   local race_root="$race_parent/source" replacement="$FIXTURES/publish-race-replacement"
   local gate="$TMP_ROOT/publish-race-verified" sync_pid original_device original_inode out
+  local registry registry_device registry_inode registry_sha replacement_registry status
   mkdir -p "$race_home/config" "$race_root/records" "$replacement/records"
   printf '# Original\npublishidentityoriginalcanary\n' > "$race_root/records/race.md"
   printf '# Replacement\npublishidentityreplacementcanary\n' > "$replacement/records/race.md"
   original_device=$(stat -f '%d' "$race_root" 2>/dev/null || stat -c '%d' "$race_root")
   original_inode=$(stat -f '%i' "$race_root" 2>/dev/null || stat -c '%i' "$race_root")
+  registry="$race_home/config/knowledge-sources.json"
   jq -n --arg root "$race_root" \
     '{schema:"firstmate.knowledge-sources.v1",sources:[
       {id:"publish-race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
-    ]}' > "$race_home/config/knowledge-sources.json"
-  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_IDENTITY_VERIFY="$gate" \
+    ]}' > "$registry"
+  registry_device=$(stat -f '%d' "$registry" 2>/dev/null || stat -c '%d' "$registry")
+  registry_inode=$(stat -f '%i' "$registry" 2>/dev/null || stat -c '%i' "$registry")
+  registry_sha=$(sha_of "$registry")
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_PUBLICATION_VERIFY="$gate" \
     "$CLI" sync --source publish-race --json > "$TMP_ROOT/publish-race-sync.out" 2>&1 &
   sync_pid=$!
   while [ ! -e "$gate.ready" ]; do
@@ -682,6 +704,12 @@ test_post_verify_replacement_keeps_identity_provenance() {
   mv "$race_parent" "$FIXTURES/publish-race-parent-original"
   mkdir -p "$race_parent"
   cp -R "$replacement" "$race_root"
+  replacement_registry="$race_home/config/knowledge-sources.replacement.json"
+  jq -n --arg root "$race_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"publish-race",root:$root,owner:"Replacement Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$replacement_registry"
+  mv "$replacement_registry" "$registry"
   : > "$gate.release"
   wait "$sync_pid" || fail "publish race failed despite stable opened-root provenance"
   out=$(FM_HOME="$race_home" "$CLI" search --source publish-race --query publishidentityoriginalcanary --json)
@@ -692,7 +720,16 @@ test_post_verify_replacement_keeps_identity_provenance() {
     || fail "publish race reported the replacement root inode"
   out=$(FM_HOME="$race_home" "$CLI" search --source publish-race --query publishidentityreplacementcanary --json)
   assert_result_count "$out" 0 "publish race indexed replacement-root content"
-  pass "post-verification replacement retains accurate opened-root provenance"
+  status=$(FM_HOME="$race_home" "$CLI" status --source publish-race --json)
+  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_device')" = "$registry_device" ] \
+    || fail "publish race reported the replacement registry device"
+  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_inode')" = "$registry_inode" ] \
+    || fail "publish race reported the replacement registry inode"
+  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_sha256')" = "$registry_sha" ] \
+    || fail "publish race reported replacement registry content"
+  [ "$(printf '%s' "$status" | jq -r '.metadata.registry_locator')" = "$registry" ] \
+    || fail "publish race lost the registry snapshot locator"
+  pass "publication records actual source and registry snapshot provenance"
 }
 
 test_fts5_diagnostic() {
@@ -722,6 +759,7 @@ test_atomic_failure_preserves_previous_index
 test_deletion_and_rename_propagation
 test_safe_source_removal
 test_sync_remove_source_coordination
+test_source_operation_lock_rejects_symlink
 test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
 test_root_replacement_rejects_stale_provenance

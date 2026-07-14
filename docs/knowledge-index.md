@@ -57,7 +57,8 @@ Source roots are pairwise disjoint: no root may equal, contain, or be contained 
 Search, status, and removal validate the registry structure and selected source identity without requiring the canonical root to remain online, so a previously built projection remains usable after a failed sync.
 Sync additionally validates every registered physical root and their pairwise separation immediately before reading the selected source.
 Each sync binds schema validation, all registered roots, and every selected-source field to one stable registry snapshot.
-If the registry path changes identity or content before publication, sync fails closed and preserves the previous database byte-for-byte.
+Before publication, sync checks whether the current registry locator still names the validated snapshot and fails closed if a change is observed.
+That locator check is best-effort rather than a pathname lease because POSIX permits a cooperating process to rename the registry immediately after the check.
 
 ## Built-in safety denies
 
@@ -73,7 +74,7 @@ Only regular files whose names end in `.md` or `.markdown` are candidates.
 Directory and file symlinks are not followed.
 Sync opens the canonical root from the filesystem root one component at a time without following symlinks, then binds enumeration and every candidate read to that single directory descriptor.
 The snapshot records that opened directory's filesystem device and inode identity and obtains Git commit provenance while its process is positioned in that same opened directory.
-Publication reopens the registered path without following symlinks and fails closed when it no longer names the opened directory at commit time.
+Publication reopens the registered path without following symlinks and performs a best-effort current-locator check before commit.
 The filesystem identity remains attached to every result because POSIX pathnames do not provide a lease against a cooperating process renaming an ancestor after that check.
 Every candidate must remain below that opened root, match at least one allow pattern, and match neither a built-in nor configured deny.
 
@@ -88,6 +89,7 @@ The restricted ID grammar makes that mapping collision-free and prevents path tr
 No database contains another source's rows.
 
 Each database contains a `documents` table, its external-content FTS5 index, and projection metadata.
+Projection metadata records the registry locator, filesystem device and inode, and SHA-256 of the exact stable registry snapshot that supplied validation and provenance.
 Every document persists:
 
 - source ID;
@@ -126,11 +128,13 @@ When several sources are explicitly named, each database is opened independently
 The per-source limit is between 1 and 100 and defaults to 20.
 
 `sync` always builds a complete new database in the index directory and atomically renames it over the old database only after integrity checks pass.
-A registry identity and content check is part of the publication boundary, so a rebuilt database cannot publish from a registry version other than the validated snapshot.
+The database rename is the publication linearization point.
+The published database permanently identifies the exact source directory and registry snapshot used to build it, even if either current pathname is replaced after its final best-effort locator check.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
 Repeated unchanged sync produces one row per current relative path and cannot accumulate duplicates.
 Sync and removal serialize on a source-scoped operation lock, so a same-source sync already in progress cannot publish after a confirmed removal returns, while different sources remain independent.
+The lock file is atomically opened without following symlinks, verified as a regular file through that same descriptor, and held by a dedicated child process for the full operation.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
 It removes only that source's exact disposable SQLite file.

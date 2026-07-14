@@ -527,8 +527,9 @@ try:
         current = os.fstat(directory_fd)
         if (current.st_dev, current.st_ino) != expected:
             raise OSError("registered source root no longer matches snapshot")
-    finally:
+    except Exception:
         os.close(directory_fd)
+        raise
     gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_IDENTITY_VERIFY")
     if gate:
         open(gate + ".ready", "w", encoding="utf-8").close()
@@ -553,11 +554,20 @@ try:
             or digest.hexdigest() != expected_registry["sha256"]
         ):
             raise OSError("registry identity changed")
-    finally:
+    except Exception:
         os.close(registry_fd)
+        os.close(directory_fd)
+        raise
+    gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_PUBLICATION_VERIFY")
+    if gate:
+        open(gate + ".ready", "w", encoding="utf-8").close()
+        while not os.path.exists(gate + ".release"):
+            time.sleep(0.01)
     os.chmod(temporary, 0o600)
     os.replace(temporary, destination)
     os.chmod(destination, 0o600)
+    os.close(registry_fd)
+    os.close(directory_fd)
 except (KeyError, OSError, TypeError, ValueError):
     sys.exit(1)
 PY
@@ -616,30 +626,30 @@ database_path() {
 }
 
 coordinate_source_operation() {
-  local id=$1 lock_file
+  local id=$1 lock_file ready
   ensure_index_dir
   lock_file="$INDEX_DIR/.$id.operation.lock"
-  [ ! -L "$lock_file" ] \
-    || die "source operation lock is not a regular file for $id"
-  if [ -e "$lock_file" ]; then
-    [ -f "$lock_file" ] \
-      || die "source operation lock is not a regular file for $id"
-  else
-    (umask 077; : > "$lock_file") \
-      || die "cannot create source operation lock for $id"
+  coproc SOURCE_OPERATION_LOCK_HOLDER {
+    python3 -c '
+import fcntl, os, stat, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+try:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise OSError("lock is not a regular file")
+    os.fchmod(fd, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    print("ready", flush=True)
+    sys.stdin.buffer.read()
+finally:
+    os.close(fd)
+' "$lock_file"
+  }
+  if ! IFS= read -r ready <&"${SOURCE_OPERATION_LOCK_HOLDER[0]}"; then
+    die "cannot open source operation lock for $id"
   fi
-  chmod 600 "$lock_file"
-  exec {SOURCE_OPERATION_LOCK_FD}> "$lock_file" \
-    || die "cannot open source operation lock for $id"
-  if command -v flock >/dev/null 2>&1; then
-    flock -x "$SOURCE_OPERATION_LOCK_FD" \
-      || die "cannot acquire source operation lock for $id"
-  elif command -v lockf >/dev/null 2>&1; then
-    lockf "$SOURCE_OPERATION_LOCK_FD" \
-      || die "cannot acquire source operation lock for $id"
-  else
-    die "flock or lockf not found; cannot coordinate source operation for $id"
-  fi
+  [ "$ready" = ready ] || die "cannot acquire source operation lock for $id"
+  SOURCE_OPERATION_LOCK_FD=${SOURCE_OPERATION_LOCK_HOLDER[1]}
+  : "$SOURCE_OPERATION_LOCK_FD"
 }
 
 validate_database() {
@@ -684,6 +694,7 @@ command_sync() {
   local rel physical sha count manifest_sql integrity allows_json denies_json
   local snapshot_dir snapshot root_identity commit_file root_device root_inode
   local original_registry registry_snapshot registry_identity
+  local registry_device registry_inode registry_sha256
   local -a allows=() denies=()
   original_registry=$REGISTRY
   ensure_index_dir
@@ -692,6 +703,12 @@ command_sync() {
   TEMP_FILES+=("$registry_snapshot" "$registry_identity")
   snapshot_registry "$registry_snapshot" "$registry_identity" \
     || die "cannot safely snapshot registry; previous index preserved"
+  registry_device=$(jq -er '.device' "$registry_identity") \
+    || die "cannot read registry identity; previous index preserved"
+  registry_inode=$(jq -er '.inode' "$registry_identity") \
+    || die "cannot read registry identity; previous index preserved"
+  registry_sha256=$(jq -er '.sha256' "$registry_identity") \
+    || die "cannot read registry identity; previous index preserved"
   REGISTRY=$registry_snapshot
   validate_registry_structure
   validate_source_id "$id"
@@ -750,6 +767,10 @@ command_sync() {
     --arg commit "$commit" \
     --argjson root_device "$root_device" \
     --argjson root_inode "$root_inode" \
+    --arg registry_locator "$original_registry" \
+    --argjson registry_device "$registry_device" \
+    --argjson registry_inode "$registry_inode" \
+    --arg registry_sha256 "$registry_sha256" \
     --arg indexed_at "$indexed_at" \
     --slurpfile documents "$lines" \
     '{
@@ -761,6 +782,10 @@ command_sync() {
       commit:$commit,
       root_device:$root_device,
       root_inode:$root_inode,
+      registry_locator:$registry_locator,
+      registry_device:$registry_device,
+      registry_inode:$registry_inode,
+      registry_sha256:$registry_sha256,
       indexed_at:$indexed_at,
       documents:($documents | sort_by(.relative_path))
     }' > "$manifest"
@@ -817,6 +842,10 @@ UNION ALL SELECT 'repo_identity', COALESCE(json_extract(payload, '$.repo'), '') 
 UNION ALL SELECT 'commit_sha', COALESCE(json_extract(payload, '$.commit'), '') FROM manifest_input
 UNION ALL SELECT 'source_root_device', json_extract(payload, '$.root_device') FROM manifest_input
 UNION ALL SELECT 'source_root_inode', json_extract(payload, '$.root_inode') FROM manifest_input
+UNION ALL SELECT 'registry_locator', json_extract(payload, '$.registry_locator') FROM manifest_input
+UNION ALL SELECT 'registry_device', json_extract(payload, '$.registry_device') FROM manifest_input
+UNION ALL SELECT 'registry_inode', json_extract(payload, '$.registry_inode') FROM manifest_input
+UNION ALL SELECT 'registry_sha256', json_extract(payload, '$.registry_sha256') FROM manifest_input
 UNION ALL SELECT 'indexed_at', json_extract(payload, '$.indexed_at') FROM manifest_input;
 INSERT INTO documents(
   relative_path, absolute_path, source_id, owner, privacy_class,
