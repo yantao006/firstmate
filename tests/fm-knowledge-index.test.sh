@@ -850,6 +850,111 @@ test_status_fails_closed_during_index_directory_replacement() {
   pass "status fails closed after index locator replacement"
 }
 
+test_forged_supervised_mode_does_not_follow_output_symlink() {
+  local work="$TMP_ROOT/forged-output-work" target="$TMP_ROOT/forged-output-target" out
+  mkdir -p "$work"
+  printf 'preserve-me\n' > "$target"
+  ln -s "$target" "$work/.knowledge-worker-output"
+  if out=$(cd "$work" && FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_SUPERVISED=1 \
+    FM_KNOWLEDGE_INDEX_SUPERVISOR_PID=$$ "$CLI" status --source repo-a --json 2>&1); then
+    fail "forged supervised mode was accepted"
+  fi
+  [ "$(cat "$target")" = preserve-me ] \
+    || fail "forged supervised mode truncated a symlink target"
+  assert_contains "$out" 'cannot verify index operation supervisor' \
+    "forged supervised mode failure was not reported"
+  pass "forged supervised mode cannot redirect worker output"
+}
+
+test_unsafe_source_is_rejected_before_supervisor_file_access() {
+  local outside="$HOME_DIR/state/escape.sqlite3" before out
+  printf 'outside-database-sentinel\n' > "$outside"
+  before=$(sha_of "$outside")
+  if out=$(FM_HOME="$HOME_DIR" "$CLI" status --source ../escape --json 2>&1); then
+    fail "unsafe source id reached supervisor database handling"
+  fi
+  [ "$(sha_of "$outside")" = "$before" ] \
+    || fail "unsafe source id changed an outside file"
+  assert_contains "$out" 'invalid source id' \
+    "unsafe source id was not rejected before supervisor access"
+  pass "supervisor validates source IDs before database access"
+}
+
+test_supervisor_revalidates_provenance_and_state_before_commit() {
+  local race_home="$TMP_ROOT/supervisor-race-home" source_root="$FIXTURES/supervisor-race-source"
+  local gate="$TMP_ROOT/supervisor-commit" sync_pid replacement detached
+  mkdir -p "$race_home/config" "$source_root"
+  printf '# Supervisor\nsupervisorcommitcanary\n' > "$source_root/source.md"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"supervisor-race",root:$root,owner:"Supervisor Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SUPERVISOR_COMMIT="$gate" \
+    "$CLI" sync --source supervisor-race --json > "$TMP_ROOT/supervisor-race.out" 2>&1 &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "sync exited before supervisor commit gate"
+    sleep 0.01
+  done
+  replacement="$race_home/config/knowledge-sources.replacement.json"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"supervisor-race",root:$root,owner:"Replacement Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$replacement"
+  mv "$replacement" "$race_home/config/knowledge-sources.json"
+  detached="$race_home/state.detached"
+  mv "$race_home/state" "$detached"
+  mkdir -m 700 "$race_home/state"
+  : > "$gate.release"
+  if wait "$sync_pid"; then
+    fail "supervisor committed after registry and state locator replacement"
+  fi
+  [ ! -e "$race_home/state/knowledge-indexes/supervisor-race.sqlite3" ] \
+    || fail "supervisor published into the replacement state locator"
+  [ ! -e "$detached/knowledge-indexes/supervisor-race.sqlite3" ] \
+    || fail "supervisor published into the detached state locator"
+  pass "supervisor revalidates provenance and state before commit"
+}
+
+test_supervisor_rolls_back_post_verify_provenance_change() {
+  local race_home="$TMP_ROOT/supervisor-post-verify-home"
+  local source_root="$FIXTURES/supervisor-post-verify-source"
+  local gate="$TMP_ROOT/supervisor-post-verify" sync_pid replacement before after out
+  mkdir -p "$race_home/config" "$source_root"
+  printf '# Original\nsupervisororiginalcanary\n' > "$source_root/source.md"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"post-verify",root:$root,owner:"Original Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" "$CLI" sync --source post-verify --json >/dev/null
+  before=$(sha_of "$race_home/state/knowledge-indexes/post-verify.sqlite3")
+  printf '# Updated\nsupervisorupdatedcanary\n' > "$source_root/source.md"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_SUPERVISOR_VERIFY="$gate" \
+    "$CLI" sync --source post-verify --json > "$TMP_ROOT/supervisor-post-verify.out" 2>&1 &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "sync exited before post-verify supervisor gate"
+    sleep 0.01
+  done
+  replacement="$race_home/config/knowledge-sources.replacement.json"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"post-verify",root:$root,owner:"Replacement Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$replacement"
+  mv "$replacement" "$race_home/config/knowledge-sources.json"
+  : > "$gate.release"
+  if wait "$sync_pid"; then
+    fail "supervisor published after post-verification registry replacement"
+  fi
+  after=$(sha_of "$race_home/state/knowledge-indexes/post-verify.sqlite3")
+  [ "$after" = "$before" ] || fail "post-verification race did not preserve the old database"
+  out=$(FM_HOME="$race_home" "$CLI" search --source post-verify --query supervisororiginalcanary --json)
+  assert_result_count "$out" 1 "post-verification rollback lost the old database"
+  out=$(FM_HOME="$race_home" "$CLI" search --source post-verify --query supervisorupdatedcanary --json)
+  assert_result_count "$out" 0 "post-verification race published the new database"
+  pass "supervisor rolls back post-verification provenance changes"
+}
+
 test_fts5_diagnostic() {
   local fakebin out
   fakebin=$(fm_fakebin "$TMP_ROOT/fts5-missing")
@@ -892,4 +997,8 @@ test_bare_repository_has_no_commit_provenance
 test_post_verify_replacement_fails_closed
 test_remove_replacement_preserves_replacement_database
 test_status_fails_closed_during_index_directory_replacement
+test_forged_supervised_mode_does_not_follow_output_symlink
+test_unsafe_source_is_rejected_before_supervisor_file_access
+test_supervisor_revalidates_provenance_and_state_before_commit
+test_supervisor_rolls_back_post_verify_provenance_change
 test_fts5_diagnostic
