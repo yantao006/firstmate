@@ -52,10 +52,10 @@ Glob patterns are relative POSIX-style patterns using literal path characters, `
 Allow patterns must end in `.md` or `.markdown`, case-insensitively.
 Absolute patterns, empty segments, `.` or `..` segments, backslashes, and bracket expressions are rejected.
 
-Registry validation requires every root to exist and be canonical.
+Registry validation resolves every root fail-closed and requires it to exist and already equal its canonical physical path.
 Source roots are pairwise disjoint: no root may equal, contain, or be contained by another source root, regardless of registry order.
 Search, status, and removal validate the registry structure and selected source identity without requiring the canonical root to remain online, so a previously built projection remains usable after a failed sync.
-Sync additionally validates the selected root immediately before reading it.
+Sync additionally validates every registered physical root and their pairwise separation immediately before reading the selected source.
 
 ## Built-in safety denies
 
@@ -69,7 +69,8 @@ They cannot remove or override these built-in denies:
 
 Only regular files whose names end in `.md` or `.markdown` are candidates.
 Directory and file symlinks are not followed.
-Every candidate must remain physically below the canonical root after resolution, match at least one allow pattern, and match neither a built-in nor configured deny.
+Sync opens the canonical root from the filesystem root one component at a time without following symlinks, then binds enumeration and every candidate read to that single directory descriptor.
+Every candidate must remain below that opened root, match at least one allow pattern, and match neither a built-in nor configured deny.
 
 ## Index storage and schema
 

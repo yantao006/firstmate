@@ -438,6 +438,18 @@ test_registry_path_traversal_and_root_rejection() {
   fi
   [ ! -e "$invalid_home/state/knowledge-indexes/outer-public.sqlite3" ] \
     || fail "later overlapping outer source indexed nestedprivatecanary"
+  ln -s "$PUBLIC/nested-private" "$FIXTURES/nested-private-alias"
+  jq -n --arg outer "$PUBLIC" --arg alias "$FIXTURES/nested-private-alias" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"outer-public",root:$outer,owner:"Public Owner",privacy:"public",markdown_allow:["*.md"],deny:[]},
+      {id:"aliased-private",root:$alias,owner:"Private Owner",privacy:"captain-private",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$invalid_registry"
+  if FM_HOME="$invalid_home" "$CLI" sync --source outer-public --json >/dev/null 2>&1; then
+    fail "sync accepted a foreign source aliased inside the selected root"
+  fi
+  [ ! -e "$invalid_home/state/knowledge-indexes/outer-public.sqlite3" ] \
+    || fail "aliased private source leaked nestedprivatecanary into the outer index"
+  rm "$FIXTURES/nested-private-alias"
   rm -rf "$PUBLIC/nested-private"
   pass "source ID, pattern, root traversal, and symlink-root rejection"
 }
@@ -467,9 +479,39 @@ test_directory_replacement_does_not_escape_root() {
   fi
   [ ! -e "$race_home/state/knowledge-indexes/race.sqlite3" ] \
     || fail "failed race sync published an index"
-  assert_contains "$(cat "$TMP_ROOT/race-sync.out")" 'cannot safely snapshot source file' \
+  assert_contains "$(cat "$TMP_ROOT/race-sync.out")" 'cannot safely snapshot source tree' \
     "race sync did not report a safe snapshot failure"
   pass "root-bound snapshot rejects concurrent intermediate-directory replacement"
+}
+
+test_root_replacement_stays_bound_to_open_root() {
+  local race_home="$TMP_ROOT/root-race-home" race_parent="$FIXTURES/root-race-parent"
+  local race_root="$race_parent/source" outside="$FIXTURES/root-race-outside"
+  local gate="$TMP_ROOT/root-race-snapshot" sync_pid out
+  mkdir -p "$race_home/config" "$race_root/records" "$outside/records"
+  printf '# Safe\nrootboundsafecanary\n' > "$race_root/records/race.md"
+  printf '# Foreign\nrootboundforeigncanary\n' > "$outside/records/race.md"
+  jq -n --arg root "$race_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"root-race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT="$gate" \
+    "$CLI" sync --source root-race --json > "$TMP_ROOT/root-race-sync.out" 2> "$TMP_ROOT/root-race-sync.err" &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "root race sync exited before reaching the snapshot gate"
+    sleep 0.01
+  done
+  mv "$race_parent" "$FIXTURES/root-race-parent-original"
+  mkdir -p "$race_parent"
+  cp -R "$outside" "$race_root"
+  : > "$gate.release"
+  wait "$sync_pid" || fail "root-bound sync failed after pathname replacement"
+  out=$(FM_HOME="$race_home" "$CLI" search --source root-race --query rootboundsafecanary --json)
+  assert_result_count "$out" 1 "root-bound sync lost content from the opened root"
+  out=$(FM_HOME="$race_home" "$CLI" search --source root-race --query rootboundforeigncanary --json)
+  assert_result_count "$out" 0 "root replacement redirected reads to foreign content"
+  pass "enumeration and reads remain bound to one stable root descriptor"
 }
 
 test_fts5_diagnostic() {
@@ -501,4 +543,5 @@ test_safe_source_removal
 test_sync_remove_source_coordination
 test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
+test_root_replacement_stays_bound_to_open_root
 test_fts5_diagnostic

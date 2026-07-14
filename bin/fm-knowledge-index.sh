@@ -201,25 +201,46 @@ validate_source_root() {
 }
 
 validate_all_roots() {
-  local id
+  local id physical index other_index root other_root
+  local -a roots=()
   while IFS= read -r id; do
     validate_source_root "$id"
+    root=$(source_field "$id" root)
+    physical=$(cd "$root" 2>/dev/null && pwd -P) \
+      || die "cannot resolve source root for $id: $root"
+    roots+=("$physical")
   done < <(jq -r '.sources[].id' "$REGISTRY")
+  for ((index=0; index<${#roots[@]}; index++)); do
+    root=${roots[$index]}
+    for ((other_index=index + 1; other_index<${#roots[@]}; other_index++)); do
+      other_root=${roots[$other_index]}
+      case "$root/" in
+        "$other_root/"*) die "source roots must not overlap: $root and $other_root" ;;
+      esac
+      case "$other_root/" in
+        "$root/"*) die "source roots must not overlap: $root and $other_root" ;;
+      esac
+    done
+  done
 }
 
-snapshot_source_file() {
-  local root=$1 relative_path=$2 snapshot=$3
-  python3 - "$root" "$relative_path" "$snapshot" <<'PY'
+snapshot_source_tree() {
+  local root=$1 allows_json=$2 denies_json=$3 snapshot_dir=$4 file_list=$5
+  python3 - "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" <<'PY'
+import fnmatch
+import json
 import os
 import stat
 import sys
+import time
 
 try:
-    root, relative_path, snapshot = sys.argv[1:]
-    parts = relative_path.split("/")
-    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    root, allows_json, denies_json, snapshot_dir, file_list = sys.argv[1:]
+    allows = json.loads(allows_json)
+    denies = json.loads(denies_json)
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in parts[:-1]:
+        for part in root.split("/")[1:]:
             next_fd = os.open(
                 part,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -227,25 +248,109 @@ try:
             )
             os.close(directory_fd)
             directory_fd = next_fd
-        source_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        try:
-            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-                raise OSError("source is not a regular file")
-            destination_fd = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                while True:
-                    chunk = os.read(source_fd, 1024 * 1024)
-                    if not chunk:
-                        break
-                    view = memoryview(chunk)
-                    while view:
-                        written = os.write(destination_fd, view)
-                        view = view[written:]
-                os.fsync(destination_fd)
-            finally:
-                os.close(destination_fd)
-        finally:
-            os.close(source_fd)
+
+        candidates = []
+
+        def denied(path):
+            wrapped = "/" + path + "/"
+            basename = path.rsplit("/", 1)[-1]
+            if basename == ".env" or basename.startswith(".env."):
+                return True
+            if basename in {
+                "backlog.md", "secret.md", "secrets.md", "credential.md",
+                "credentials.md", "feedback.md",
+            } or "generated-feedback" in basename:
+                return True
+            if path == "data/captain.md" or fnmatch.fnmatchcase(path, "*/data/captain.md"):
+                return True
+            if fnmatch.fnmatchcase(path, "data/*/brief.md") or fnmatch.fnmatchcase(path, "*/data/*/brief.md"):
+                return True
+            for segment in {
+                "secret", "secrets", "credential", "credentials", "backlogs",
+                ".lavish", "generated", "feedback", "node_modules", "vendor",
+                "build", "dist", "out", "target", "coverage", ".next",
+            }:
+                if f"/{segment}/" in wrapped:
+                    return True
+            return any(fnmatch.fnmatchcase(path, pattern) for pattern in denies)
+
+        def enumerate_directory(parent_fd, prefix=""):
+            with os.scandir(parent_fd) as entries:
+                ordered = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            for entry in ordered:
+                path = entry.name if not prefix else prefix + "/" + entry.name
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            enumerate_directory(child_fd, path)
+                        finally:
+                            os.close(child_fd)
+                    elif entry.is_file(follow_symlinks=False):
+                        lower = entry.name.lower()
+                        if not (lower.endswith(".md") or lower.endswith(".markdown")):
+                            continue
+                        if not any(fnmatch.fnmatchcase(path, pattern) for pattern in allows):
+                            continue
+                        if not denied(path):
+                            candidates.append(path)
+                except FileNotFoundError:
+                    raise OSError("source changed during enumeration")
+
+        enumerate_directory(directory_fd)
+        gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT")
+        if gate:
+            open(gate + ".ready", "w", encoding="utf-8").close()
+            while not os.path.exists(gate + ".release"):
+                time.sleep(0.01)
+
+        with open(file_list, "wb") as output:
+            for ordinal, relative_path in enumerate(candidates, 1):
+                current_fd = os.dup(directory_fd)
+                parts = relative_path.split("/")
+                try:
+                    for part in parts[:-1]:
+                        next_fd = os.open(
+                            part,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=current_fd,
+                        )
+                        os.close(current_fd)
+                        current_fd = next_fd
+                    source_fd = os.open(
+                        parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd
+                    )
+                    try:
+                        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                            raise OSError("source is not a regular file")
+                        snapshot = os.path.join(snapshot_dir, f"{ordinal}.md")
+                        destination_fd = os.open(
+                            snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                        try:
+                            while True:
+                                chunk = os.read(source_fd, 1024 * 1024)
+                                if not chunk:
+                                    break
+                                view = memoryview(chunk)
+                                while view:
+                                    written = os.write(destination_fd, view)
+                                    view = view[written:]
+                            os.fsync(destination_fd)
+                        finally:
+                            os.close(destination_fd)
+                    finally:
+                        os.close(source_fd)
+                finally:
+                    os.close(current_fd)
+                output.write(os.fsencode(relative_path) + b"\0")
+                output.write(os.fsencode(snapshot) + b"\0")
     finally:
         os.close(directory_fd)
 except OSError:
@@ -371,12 +476,12 @@ command_validate() {
 
 command_sync() {
   local id=$1 root owner privacy repo commit indexed_at db tmp_db lines manifest file_list
-  local file rel physical allowed denied pattern sha count manifest_sql integrity
-  local snapshot_dir snapshot ordinal=0
+  local rel physical sha count manifest_sql integrity allows_json denies_json
+  local snapshot_dir snapshot
   local -a allows=() denies=()
   validate_registry_structure
   validate_source_id "$id"
-  validate_source_root "$id"
+  validate_all_roots
   ensure_index_dir
   root=$(source_field "$id" root)
   owner=$(source_field "$id" owner)
@@ -392,6 +497,8 @@ command_sync() {
     < <(jq -r --arg id "$id" '.sources[] | select(.id == $id) | .markdown_allow[]' "$REGISTRY")
   while IFS= read -r pattern; do denies+=("$pattern"); done \
     < <(jq -r --arg id "$id" '.sources[] | select(.id == $id) | .deny[]' "$REGISTRY")
+  allows_json=$(jq -c --arg id "$id" '.sources[] | select(.id == $id) | .markdown_allow' "$REGISTRY")
+  denies_json=$(jq -c --arg id "$id" '.sources[] | select(.id == $id) | .deny' "$REGISTRY")
 
   lines=$(mktemp "$INDEX_DIR/.knowledge-manifest-lines.XXXXXX")
   manifest=$(mktemp "$INDEX_DIR/.knowledge-manifest.XXXXXX")
@@ -401,38 +508,12 @@ command_sync() {
   TEMP_FILES+=("$lines" "$manifest" "$file_list" "$tmp_db")
   TEMP_DIRS+=("$snapshot_dir")
 
-  if ! LC_ALL=C find "$root" -type f \( -iname '*.md' -o -iname '*.markdown' \) -print0 \
-    | LC_ALL=C sort -z > "$file_list"; then
-    die "cannot enumerate source $id; previous index preserved"
-  fi
+  snapshot_source_tree "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" \
+    || die "cannot safely snapshot source tree for $id; previous index preserved"
 
-  while IFS= read -r -d '' file; do
-    rel=${file#"$root"/}
+  while IFS= read -r -d '' rel && IFS= read -r -d '' snapshot; do
     safe_relative_path "$rel" || die "unsafe relative path under $id"
-    [ -f "$file" ] && [ ! -L "$file" ] || continue
     physical="$root/$rel"
-    allowed=0
-    for pattern in "${allows[@]}"; do
-      if glob_matches "$rel" "$pattern"; then allowed=1; break; fi
-    done
-    [ "$allowed" -eq 1 ] || continue
-    built_in_denied "$rel" && continue
-    denied=0
-    for pattern in "${denies[@]:-}"; do
-      [ -n "$pattern" ] || continue
-      if glob_matches "$rel" "$pattern"; then denied=1; break; fi
-    done
-    [ "$denied" -eq 0 ] || continue
-    ordinal=$((ordinal + 1))
-    snapshot="$snapshot_dir/$ordinal.md"
-    if [ -n "${FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT:-}" ]; then
-      : > "$FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT.ready"
-      while [ ! -e "$FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT.release" ]; do
-        sleep 0.01
-      done
-    fi
-    snapshot_source_file "$root" "$rel" "$snapshot" \
-      || die "cannot safely snapshot source file: $rel"
     [ -f "$snapshot" ] && [ ! -L "$snapshot" ] \
       || die "source file changed into a symlink while syncing: $rel"
     sha=$(hash_file "$snapshot") || die "cannot hash source file: $rel"
