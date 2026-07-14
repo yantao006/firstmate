@@ -22,7 +22,7 @@ REGISTRY_SCHEMA="firstmate.knowledge-sources.v1"
 JSON=0
 TEMP_FILES=()
 TEMP_DIRS=()
-ORIGINAL_ARGS=("$@")
+SOURCE_OPERATION_LOCK_FD=
 
 cleanup() {
   local file directory
@@ -245,11 +245,6 @@ database_path() {
 
 coordinate_source_operation() {
   local id=$1 lock_file
-  if [ -n "${FM_KNOWLEDGE_INDEX_LOCKED_SOURCE:-}" ]; then
-    [ "$FM_KNOWLEDGE_INDEX_LOCKED_SOURCE" = "$id" ] \
-      || die "source operation lock does not match selected source $id"
-    return
-  fi
   ensure_index_dir
   lock_file="$INDEX_DIR/.$id.operation.lock"
   [ ! -L "$lock_file" ] \
@@ -262,16 +257,17 @@ coordinate_source_operation() {
       || die "cannot create source operation lock for $id"
   fi
   chmod 600 "$lock_file"
+  exec {SOURCE_OPERATION_LOCK_FD}> "$lock_file" \
+    || die "cannot open source operation lock for $id"
   if command -v flock >/dev/null 2>&1; then
-    FM_KNOWLEDGE_INDEX_LOCKED_SOURCE="$id" \
-      flock -x "$lock_file" "$SCRIPT_DIR/fm-knowledge-index.sh" "${ORIGINAL_ARGS[@]}"
+    flock -x "$SOURCE_OPERATION_LOCK_FD" \
+      || die "cannot acquire source operation lock for $id"
   elif command -v lockf >/dev/null 2>&1; then
-    FM_KNOWLEDGE_INDEX_LOCKED_SOURCE="$id" \
-      lockf -k "$lock_file" "$SCRIPT_DIR/fm-knowledge-index.sh" "${ORIGINAL_ARGS[@]}"
+    lockf "$SOURCE_OPERATION_LOCK_FD" \
+      || die "cannot acquire source operation lock for $id"
   else
     die "flock or lockf not found; cannot coordinate source operation for $id"
   fi
-  exit $?
 }
 
 validate_database() {

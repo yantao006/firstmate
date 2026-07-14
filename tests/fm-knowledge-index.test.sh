@@ -350,7 +350,8 @@ test_sync_remove_source_coordination() {
   local gate="$TMP_ROOT/repo-b-sync-remove" sync_pid remove_pid remove_out
   run_cli sync --source repo-b --json >/dev/null
   printf '\ncoordinationcanary\n' >> "$REPO_B/records/shared.md"
-  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH="$gate" \
+  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_LOCKED_SOURCE=repo-b \
+    FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH="$gate" \
     "$CLI" sync --source repo-b --json > "$TMP_ROOT/repo-b-sync.out" 2> "$TMP_ROOT/repo-b-sync.err" &
   sync_pid=$!
   while [ ! -e "$gate.ready" ]; do
