@@ -381,14 +381,33 @@ test_source_operation_lock_rejects_symlink() {
   rm -f "$lock_path"
   : > "$foreign_lock"
   ln -s "$foreign_lock" "$lock_path"
-  if out=$(run_cli sync --source repo-b --json 2>&1); then
-    fail "source operation accepted a symlink lock"
-  fi
-  assert_contains "$out" 'cannot open source operation lock for repo-b' \
-    "symlink lock failure was not reported"
+  out=$(run_cli sync --source repo-b --json 2>&1) \
+    || fail "replaceable legacy lock path blocked directory coordination"
   [ ! -s "$foreign_lock" ] || fail "source operation wrote through a symlink lock"
   rm "$lock_path"
-  pass "source operation lock is atomically opened without following symlinks"
+  pass "source operation coordination ignores replaceable pathname locks"
+}
+
+test_bash_32_parse_compatibility() {
+  /bin/bash -n "$CLI" || fail "knowledge index CLI does not parse with system Bash"
+  pass "knowledge index CLI retains system Bash parse compatibility"
+}
+
+test_forged_index_directory_fd_is_rejected() {
+  local foreign_dir="$TMP_ROOT/foreign-index-directory" out
+  mkdir -p "$foreign_dir"
+  exec 9< "$foreign_dir"
+  if out=$(FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_DIR_FD=9 \
+    "$CLI" sync --source repo-b --json 2>&1); then
+    exec 9<&-
+    fail "sync accepted a forged index directory descriptor"
+  fi
+  exec 9<&-
+  assert_contains "$out" 'cannot acquire source operation lock for repo-b' \
+    "forged index directory descriptor failure was not reported"
+  [ ! -e "$foreign_dir/repo-b.sqlite3" ] \
+    || fail "forged index directory descriptor received a database"
+  pass "inherited index descriptor must match the selected state area"
 }
 
 test_registry_path_traversal_and_root_rejection() {
@@ -760,6 +779,8 @@ test_deletion_and_rename_propagation
 test_safe_source_removal
 test_sync_remove_source_coordination
 test_source_operation_lock_rejects_symlink
+test_bash_32_parse_compatibility
+test_forged_index_directory_fd_is_rejected
 test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
 test_root_replacement_rejects_stale_provenance

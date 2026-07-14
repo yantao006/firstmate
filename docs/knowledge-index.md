@@ -128,13 +128,15 @@ When several sources are explicitly named, each database is opened independently
 The per-source limit is between 1 and 100 and defaults to 20.
 
 `sync` always builds a complete new database in the index directory and atomically renames it over the old database only after integrity checks pass.
+Sync and removal open the index directory from the filesystem root one component at a time without following symlinks, retain that directory descriptor for the operation, and perform publication and deletion relative to it.
 The database rename is the publication linearization point.
 The published database permanently identifies the exact source directory and registry snapshot used to build it, even if either current pathname is replaced after its final best-effort locator check.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
 Repeated unchanged sync produces one row per current relative path and cannot accumulate duplicates.
-Sync and removal serialize on a source-scoped operation lock, so a same-source sync already in progress cannot publish after a confirmed removal returns, while different sources remain independent.
-The lock file is atomically opened without following symlinks, verified as a regular file through that same descriptor, and held by a dedicated child process for the full operation.
+Sync and removal serialize on an exclusive lock on the stable opened index-directory descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
+This deliberately serializes different sources as well as the same source in exchange for avoiding replaceable pathname lock anchors and retaining Bash 3.2 compatibility.
+If a same-owner process renames the index directory while an operation is active, that operation remains bound to the original directory inode and cannot publish into the replacement pathname.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
 It removes only that source's exact disposable SQLite file.
@@ -151,6 +153,8 @@ Negative synthetic tests verify zero foreign-source canary leakage across exact,
 
 This is local process isolation, not operating-system identity authorization.
 Any process running as the same owner that can read `state/knowledge-indexes/` can directly open every database.
+Search and status atomically open the selected database without following symlinks, verify the same descriptor is a regular file, and query a private stable copy so a pathname replacement cannot redirect SQLite.
+POSIX does not prevent a malicious process running as the same owner from renaming directories or deleting files, so these mechanisms provide fail-closed CLI behavior and operation ordering, not protection against a hostile same-owner process.
 The boundary does not protect a compromised owner account, malicious canonical Markdown, terminal scrollback, backups, or an operator who explicitly selects a source they are allowed to read at the filesystem layer.
 
 C1 intentionally excludes semantic search, embeddings, code indexing, automatic capture, migration of existing content, background services, hooks, watchers, network listeners, cloud providers, credentials, and MCP.

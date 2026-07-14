@@ -11,6 +11,8 @@
 #   fm-knowledge-index.sh remove --source <id> --confirm <id> [--json]
 set -euo pipefail
 
+ORIGINAL_ARGS=("$@")
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
@@ -22,7 +24,6 @@ REGISTRY_SCHEMA="firstmate.knowledge-sources.v1"
 JSON=0
 TEMP_FILES=()
 TEMP_DIRS=()
-SOURCE_OPERATION_LOCK_FD=
 
 cleanup() {
   local file directory
@@ -563,9 +564,47 @@ try:
         open(gate + ".ready", "w", encoding="utf-8").close()
         while not os.path.exists(gate + ".release"):
             time.sleep(0.01)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, destination)
-    os.chmod(destination, 0o600)
+    index_fd_value = os.environ.get("FM_KNOWLEDGE_INDEX_DIR_FD")
+    if index_fd_value:
+        index_fd = os.dup(int(index_fd_value))
+    else:
+        index_directory = os.path.dirname(destination)
+        index_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for part in index_directory.split("/")[1:]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=index_fd,
+            )
+            os.close(index_fd)
+            index_fd = next_fd
+    try:
+        temporary_name = os.path.basename(temporary)
+        destination_name = os.path.basename(destination)
+        temporary_fd = os.open(
+            temporary_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=index_fd
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(temporary_fd).st_mode):
+                raise OSError("temporary database is not regular")
+            os.fchmod(temporary_fd, 0o600)
+        finally:
+            os.close(temporary_fd)
+        os.replace(
+            temporary_name,
+            destination_name,
+            src_dir_fd=index_fd,
+            dst_dir_fd=index_fd,
+        )
+        destination_fd = os.open(
+            destination_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=index_fd
+        )
+        try:
+            os.fchmod(destination_fd, 0o600)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(index_fd)
     os.close(registry_fd)
     os.close(directory_fd)
 except (KeyError, OSError, TypeError, ValueError):
@@ -615,6 +654,36 @@ safe_relative_path() {
 }
 
 ensure_index_dir() {
+  if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}" ]; then
+    INDEX_DIR=$INDEX_DIR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" <<'PY' \
+      || die "cannot access stable index directory: $INDEX_DIR"
+import os
+import stat
+import sys
+
+fd = int(sys.argv[1])
+provided = os.fstat(fd)
+if not stat.S_ISDIR(provided.st_mode):
+    raise OSError("index descriptor is not a directory")
+expected_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in os.environ["INDEX_DIR"].split("/")[1:]:
+        next_fd = os.open(
+            part,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=expected_fd,
+        )
+        os.close(expected_fd)
+        expected_fd = next_fd
+    expected = os.fstat(expected_fd)
+    if (provided.st_dev, provided.st_ino) != (expected.st_dev, expected.st_ino):
+        raise OSError("index descriptor does not match selected state area")
+finally:
+    os.close(expected_fd)
+os.fchmod(fd, 0o700)
+PY
+    return
+  fi
   mkdir -p -- "$INDEX_DIR"
   [ -d "$INDEX_DIR" ] || die "cannot create index directory: $INDEX_DIR"
   [ ! -L "$INDEX_DIR" ] || die "index directory must not be a symlink: $INDEX_DIR"
@@ -626,41 +695,132 @@ database_path() {
 }
 
 coordinate_source_operation() {
-  local id=$1 lock_file ready
-  ensure_index_dir
-  lock_file="$INDEX_DIR/.$id.operation.lock"
-  coproc SOURCE_OPERATION_LOCK_HOLDER {
-    python3 -c '
-import fcntl, os, stat, sys
-fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+  local id=$1
+  if [ -n "${FM_KNOWLEDGE_INDEX_DIR_FD:-}" ]; then
+    INDEX_DIR=$INDEX_DIR python3 - "$FM_KNOWLEDGE_INDEX_DIR_FD" <<'PY' \
+      || die "cannot acquire source operation lock for $id"
+import fcntl
+import os
+import stat
+import sys
+
+fd = int(sys.argv[1])
+provided = os.fstat(fd)
+if not stat.S_ISDIR(provided.st_mode):
+    raise OSError("index descriptor is not a directory")
+expected_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        raise OSError("lock is not a regular file")
-    os.fchmod(fd, 0o600)
+    for part in os.environ["INDEX_DIR"].split("/")[1:]:
+        next_fd = os.open(
+            part,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=expected_fd,
+        )
+        os.close(expected_fd)
+        expected_fd = next_fd
+    expected = os.fstat(expected_fd)
+    if (provided.st_dev, provided.st_ino) != (expected.st_dev, expected.st_ino):
+        raise OSError("index descriptor does not match selected state area")
+finally:
+    os.close(expected_fd)
+fcntl.flock(fd, fcntl.LOCK_EX)
+PY
+    return
+  fi
+  python3 - "$INDEX_DIR" "$0" "${ORIGINAL_ARGS[@]}" <<'PY'
+import fcntl
+import os
+import stat
+import subprocess
+import sys
+
+index_dir, script, *arguments = sys.argv[1:]
+fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in index_dir.split("/")[1:]:
+        try:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=fd,
+            )
+        except FileNotFoundError:
+            os.mkdir(part, 0o700, dir_fd=fd)
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=fd,
+            )
+        os.close(fd)
+        fd = next_fd
+    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        raise OSError("index path is not a directory")
+    os.fchmod(fd, 0o700)
     fcntl.flock(fd, fcntl.LOCK_EX)
-    print("ready", flush=True)
-    sys.stdin.buffer.read()
+    os.set_inheritable(fd, True)
+    environment = os.environ.copy()
+    environment["FM_KNOWLEDGE_INDEX_DIR_FD"] = str(fd)
+    completed = subprocess.run(
+        [script] + arguments,
+        env=environment,
+        pass_fds=(fd,),
+        check=False,
+    )
+    sys.exit(completed.returncode)
 finally:
     os.close(fd)
-' "$lock_file"
-  }
-  if ! IFS= read -r ready <&"${SOURCE_OPERATION_LOCK_HOLDER[0]}"; then
-    die "cannot open source operation lock for $id"
-  fi
-  [ "$ready" = ready ] || die "cannot acquire source operation lock for $id"
-  SOURCE_OPERATION_LOCK_FD=${SOURCE_OPERATION_LOCK_HOLDER[1]}
-  : "$SOURCE_OPERATION_LOCK_FD"
+PY
+  exit $?
 }
 
 validate_database() {
-  local id=$1 db=$2 stored integrity
-  [ -f "$db" ] || die "index not found for $id; run sync --source $id"
-  [ ! -L "$db" ] || die "index database must not be a symlink for $id"
-  stored=$(sqlite3 -readonly "$db" \
+  local id=$1 db=$2 stable_db stored integrity
+  stable_db=$(mktemp "$INDEX_DIR/.knowledge-database-snapshot.XXXXXX")
+  TEMP_FILES+=("$stable_db")
+  python3 - "$INDEX_DIR" "$id.sqlite3" "$stable_db" <<'PY' \
+    || die "index not found or unsafe for $id; run sync --source $id"
+import os
+import stat
+import sys
+
+directory, name, snapshot = sys.argv[1:]
+directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in directory.split("/")[1:]:
+        next_fd = os.open(
+            part,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        os.close(directory_fd)
+        directory_fd = next_fd
+    source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise OSError("database is not regular")
+        destination_fd = os.open(snapshot, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        try:
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(destination_fd, view):]
+            os.fsync(destination_fd)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+finally:
+    os.close(directory_fd)
+PY
+  VALIDATED_DATABASE=$stable_db
+  stored=$(sqlite3 -readonly "$stable_db" \
     "SELECT value FROM metadata WHERE key = 'source_id';" 2>/dev/null) \
     || die "cannot read index metadata for $id"
   [ "$stored" = "$id" ] || die "index metadata does not match selected source $id"
-  integrity=$(sqlite3 -readonly "$db" "PRAGMA quick_check;" 2>/dev/null) \
+  integrity=$(sqlite3 -readonly "$stable_db" "PRAGMA quick_check;" 2>/dev/null) \
     || die "cannot check index integrity for $id"
   [ "$integrity" = ok ] || die "index integrity check failed for $id"
 }
@@ -946,6 +1106,7 @@ command_search() {
     seen+=("$id")
     db=$(database_path "$id")
     validate_database "$id" "$db"
+    db=$VALIDATED_DATABASE
     query_sql=${query_file//\'/\'\'}
     if ! rows=$(sqlite3 -readonly -json \
       -cmd '.parameter init' \
@@ -996,11 +1157,13 @@ command_search() {
 }
 
 command_status() {
-  local id=$1 db metadata bytes documents payload
+  local id=$1 db database_locator metadata bytes documents payload
   validate_registry_structure
   validate_source_id "$id"
   db=$(database_path "$id")
+  database_locator=$db
   validate_database "$id" "$db"
+  db=$VALIDATED_DATABASE
   metadata=$(sqlite3 -readonly -json "$db" \
     "SELECT key, value FROM metadata ORDER BY key;" 2>/dev/null) \
     || die "cannot read index status for $id"
@@ -1009,7 +1172,7 @@ command_status() {
   documents=$(sqlite3 -readonly "$db" "SELECT count(*) FROM documents;" 2>/dev/null) \
     || die "cannot count index documents for $id"
   payload=$(jq -cn \
-    --arg source "$id" --arg database "$db" \
+    --arg source "$id" --arg database "$database_locator" \
     --argjson bytes "$bytes" --argjson documents "$documents" \
     --argjson metadata "$metadata" \
     '{
@@ -1026,7 +1189,7 @@ command_status() {
     printf '%s: %s documents, %s bytes, indexed %s\n' \
       "$id" "$documents" "$bytes" "$(printf '%s' "$payload" | jq -r '.metadata.indexed_at')"
     printf '  database=%s privacy=%s owner=%s root=%s\n' \
-      "$db" \
+      "$database_locator" \
       "$(printf '%s' "$payload" | jq -r '.metadata.privacy_class')" \
       "$(printf '%s' "$payload" | jq -r '.metadata.owner')" \
       "$(printf '%s' "$payload" | jq -r '.metadata.source_root')"
@@ -1040,14 +1203,42 @@ command_remove() {
   [ "$confirm" = "$id" ] \
     || die "removal requires --confirm $id"
   db=$(database_path "$id")
-  if [ -L "$db" ]; then
-    die "refusing to remove symlinked index for $id"
-  fi
-  if [ -e "$db" ]; then
-    [ -f "$db" ] || die "refusing to remove non-file index path for $id"
-    rm -f -- "$db"
-    removed=true
-  fi
+  removed=$(python3 - "$INDEX_DIR" "$id.sqlite3" <<'PY'
+import os
+import stat
+import sys
+
+directory, name = sys.argv[1:]
+fd_value = os.environ.get("FM_KNOWLEDGE_INDEX_DIR_FD")
+if fd_value:
+    directory_fd = os.dup(int(fd_value))
+else:
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    for part in directory.split("/")[1:]:
+        next_fd = os.open(
+            part,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        os.close(directory_fd)
+        directory_fd = next_fd
+try:
+    try:
+        target_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    except FileNotFoundError:
+        print("false")
+    else:
+        try:
+            if not stat.S_ISREG(os.fstat(target_fd).st_mode):
+                raise OSError("database is not regular")
+        finally:
+            os.close(target_fd)
+        os.unlink(name, dir_fd=directory_fd)
+        print("true")
+finally:
+    os.close(directory_fd)
+PY
+  ) || die "refusing to remove unsafe index path for $id"
   if [ "$JSON" -eq 1 ]; then
     jq -cn --arg source "$id" --arg database "$db" --argjson removed "$removed" \
       '{schema:"fm-knowledge-index.remove.v1",source:$source,database:$database,removed:$removed}'
