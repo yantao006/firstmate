@@ -130,13 +130,14 @@ When several sources are explicitly named, each database is opened independently
 The per-source limit is between 1 and 100 and defaults to 20.
 
 `sync` always builds a complete new database in a private operation directory under the selected state root and atomically renames it into the index locator only after integrity checks pass.
-Every database command is launched by a Python supervisor that opens the selected state root from the filesystem root one component at a time without following symlinks and retains an exclusive lock on that stable descriptor until the command finishes.
+Every database command is launched by a Python supervisor that opens the selected state root from the filesystem root one component at a time without following symlinks, retains the full ancestor descriptor identity chain, and holds an exclusive lock on the stable state descriptor until the command finishes.
 The worker receives only the private operation directory and cannot publish, remove, or emit caller-visible success output.
 The supervisor validates every source ID before deriving a database name, snapshots databases for reads, commits prepared sync databases, quarantines removals, and releases subprocess-captured output.
 Inherited supervisor environment values are not authorization for index mutation.
-The database rename is the publication linearization point.
+The database replace is the publication linearization point.
 Immediately before committing a prepared database, the supervisor independently reopens and verifies the source-root device and inode plus the registry device, inode, and content digest recorded inside that database.
-It repeats those provenance and locator checks after the rename and restores the previous database if any check or rename step fails.
+Before replacement it creates a hard-link recovery reference to any previous database, then publishes with one atomic replace so the canonical pathname never has an intermediate absent state.
+It repeats those provenance and full locator-chain checks after replacement and restores the previous database if any check or replacement step fails.
 The published database permanently identifies the exact source directory and registry snapshot accepted at that commit boundary.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
@@ -144,12 +145,14 @@ Repeated unchanged sync produces one row per current relative path and cannot ac
 Sync and removal serialize on an exclusive lock on the stable opened state-root descriptor, so an earlier sync cannot publish into the selected index directory after a confirmed removal returns.
 This deliberately serializes different sources as well as the same source in exchange for avoiding replaceable pathname lock anchors and retaining Bash 3.2 compatibility.
 Search and status receive private snapshots created by the supervisor before the worker starts, so the worker never reads through a detached index directory.
-The supervisor retains both the selected state parent and state directory descriptors, buffers command output until the worker exits, verifies that the state and index locators still identify the directories opened at operation start, performs any final state-root-relative commit, and releases output only after another successful locator check.
+The supervisor retains descriptors and identities for every selected state ancestor from the filesystem root, buffers command output until the worker exits, verifies that the complete state and index locator chain still identifies the directories opened at operation start, performs any final state-root-relative commit, and releases output only after another successful locator check.
 Replacing the state or index directory during an operation cannot make the worker publish, read, or remove through the detached directory.
-An actor with the same operating-system identity can directly edit files in the selected state area and is outside this filesystem isolation boundary, but forged worker environment values do not grant the CLI supervisor's commit authority.
+An actor with the same operating-system identity can construct equivalent descriptors, parent processes, and environment values or directly edit files in the selected state area, and is outside this filesystem isolation boundary.
+The supervisor protocol prevents accidental inherited environment from granting commit authority but is not an authentication boundary against a hostile process running as that identity.
 
 `remove` accepts exactly one validated source and requires `--confirm <same-source-id>`.
-It quarantines the selected database with an atomic same-directory rename, verifies that the quarantined inode is the exact previously opened object, and only then unlinks it.
+It quarantines the selected database with an atomic same-directory rename, verifies that the quarantined inode is the exact previously opened object, and stages it in the private operation directory while the full state locator remains valid.
+If a locator check fails before successful completion, the supervisor restores the staged inode to the canonical pathname.
 If the pathname was replaced during validation, removal preserves the replacement and fails closed.
 It never changes the registry, canonical root, or any other source database.
 

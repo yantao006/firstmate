@@ -739,6 +739,8 @@ if command in ("sync", "status", "remove") and len(sources) != 1:
 parent_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
     state_parts = state_dir.split("/")[1:]
+    ancestor_fds = [os.dup(parent_fd)]
+    ancestor_identities = [os.fstat(ancestor_fds[0])]
     for part in state_parts[:-1]:
         try:
             next_fd = os.open(
@@ -755,6 +757,8 @@ try:
             )
         os.close(parent_fd)
         parent_fd = next_fd
+        ancestor_fds.append(os.dup(parent_fd))
+        ancestor_identities.append(os.fstat(ancestor_fds[-1]))
     state_name = state_parts[-1]
     try:
         fd = os.open(
@@ -771,7 +775,35 @@ try:
         raise OSError("state path is not a directory")
     state_identity = os.fstat(fd)
 
+    def ancestors_match():
+        current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            current = os.fstat(current_fd)
+            expected = ancestor_identities[0]
+            if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+                return False
+            for index, part in enumerate(state_parts[:-1], 1):
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+                current = os.fstat(current_fd)
+                expected = ancestor_identities[index]
+                if (current.st_dev, current.st_ino) != (
+                    expected.st_dev,
+                    expected.st_ino,
+                ):
+                    return False
+            return True
+        finally:
+            os.close(current_fd)
+
     def state_matches():
+        if not ancestors_match():
+            return False
         current_fd = os.open(
             state_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
@@ -841,7 +873,9 @@ try:
                         chunk = os.read(source_fd, 1024 * 1024)
                         if not chunk:
                             break
-                        os.write(destination_fd, chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(destination_fd, view):]
                     os.fsync(destination_fd)
                 finally:
                     os.close(destination_fd)
@@ -971,13 +1005,20 @@ try:
         published = False
         try:
             try:
-                os.rename(
+                os.link(
                     "knowledge-indexes/" + source + ".sqlite3", previous,
                     src_dir_fd=fd, dst_dir_fd=fd,
+                    follow_symlinks=False,
                 )
             except FileNotFoundError:
                 had_previous = False
-            os.rename(
+            gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_BACKUP_LINK")
+            if gate:
+                open(gate + ".ready", "w", encoding="utf-8").close()
+                while not os.path.exists(gate + ".release"):
+                    import time
+                    time.sleep(0.01)
+            os.replace(
                 work_name + "/" + prepared,
                 "knowledge-indexes/" + source + ".sqlite3",
                 src_dir_fd=fd,
@@ -988,23 +1029,27 @@ try:
             require_locators()
         except Exception:
             if published:
-                try:
-                    os.unlink("knowledge-indexes/" + source + ".sqlite3", dir_fd=fd)
-                except FileNotFoundError:
-                    pass
-            if had_previous:
-                os.rename(
-                    previous,
-                    "knowledge-indexes/" + source + ".sqlite3",
-                    src_dir_fd=fd,
-                    dst_dir_fd=fd,
-                )
+                if had_previous:
+                    os.replace(
+                        previous,
+                        "knowledge-indexes/" + source + ".sqlite3",
+                        src_dir_fd=fd,
+                        dst_dir_fd=fd,
+                    )
+                else:
+                    try:
+                        os.unlink("knowledge-indexes/" + source + ".sqlite3", dir_fd=fd)
+                    except FileNotFoundError:
+                        pass
+            elif had_previous:
+                os.unlink(previous, dir_fd=fd)
             raise
         if had_previous:
             os.unlink(previous, dir_fd=fd)
     elif completed.returncode == 0 and command == "remove":
         source = sources[0]
         require_locators()
+        removal_staged = False
         quarantine = ".knowledge-remove-" + secrets.token_hex(12) + ".sqlite3"
         try:
             target_fd = os.open(
@@ -1053,7 +1098,9 @@ try:
                         chunk = os.read(source_fd, 1024 * 1024)
                         if not chunk:
                             break
-                        os.write(destination_fd, chunk)
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(destination_fd, view):]
                 finally:
                     os.close(source_fd)
                     os.close(destination_fd)
@@ -1071,7 +1118,14 @@ try:
                 if stored != (source,):
                     raise OSError("database metadata mismatch")
                 require_locators()
-                os.unlink(quarantine, dir_fd=fd)
+                os.rename(
+                    quarantine,
+                    work_name + "/" + quarantine,
+                    src_dir_fd=fd,
+                    dst_dir_fd=fd,
+                )
+                removal_staged = True
+                require_locators()
                 removed = True
             except Exception:
                 try:
@@ -1081,8 +1135,12 @@ try:
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
+                    staged_name = (
+                        work_name + "/" + quarantine
+                        if removal_staged else quarantine
+                    )
                     os.rename(
-                        quarantine,
+                        staged_name,
                         "knowledge-indexes/" + source + ".sqlite3",
                         src_dir_fd=fd,
                         dst_dir_fd=fd,
@@ -1099,7 +1157,21 @@ try:
                 "removed=%s source=%s index=%s/knowledge-indexes/%s.sqlite3\n"
                 % (str(removed).lower(), source, state_dir, source)
             ).encode()
-    require_locators()
+    try:
+        require_locators()
+    except Exception:
+        if command == "remove" and locals().get("removal_staged"):
+            try:
+                os.rename(
+                    work_name + "/" + quarantine,
+                    "knowledge-indexes/" + source + ".sqlite3",
+                    src_dir_fd=fd,
+                    dst_dir_fd=fd,
+                )
+                removal_staged = False
+            except OSError:
+                pass
+        raise
     if completed.returncode == 0:
         sys.stdout.buffer.write(completed.stdout)
         sys.stdout.buffer.flush()
@@ -1120,6 +1192,8 @@ finally:
     for descriptor in (locals().get("work_fd"), locals().get("index_fd")):
         if descriptor is not None:
             os.close(descriptor)
+    for descriptor in locals().get("ancestor_fds", []):
+        os.close(descriptor)
     os.close(fd)
     os.close(parent_fd)
 PY

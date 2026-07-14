@@ -955,6 +955,30 @@ test_supervisor_rolls_back_post_verify_provenance_change() {
   pass "supervisor rolls back post-verification provenance changes"
 }
 
+test_atomic_replace_never_removes_canonical_database() {
+  local gate="$TMP_ROOT/atomic-replace-gate" sync_pid index before after
+  index="$HOME_DIR/state/knowledge-indexes/repo-a.sqlite3"
+  run_cli sync --source repo-a --json >/dev/null
+  before=$(sha_of "$index")
+  printf '\natomicreplacecanary\n' >> "$REPO_A/records/shared.md"
+  FM_HOME="$HOME_DIR" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_BACKUP_LINK="$gate" \
+    "$CLI" sync --source repo-a --json > "$TMP_ROOT/atomic-replace.out" 2>&1 &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "sync exited before atomic replace gate"
+    sleep 0.01
+  done
+  [ -f "$index" ] || fail "canonical database disappeared before atomic replace"
+  after=$(sha_of "$index")
+  [ "$after" = "$before" ] || fail "canonical database changed before atomic replace"
+  kill -9 "$sync_pid" 2>/dev/null || true
+  wait "$sync_pid" 2>/dev/null || true
+  [ -f "$index" ] || fail "interrupted publish left no canonical database"
+  after=$(sha_of "$index")
+  [ "$after" = "$before" ] || fail "interrupted publish changed the canonical database"
+  pass "sync publication keeps the canonical database through interruption"
+}
+
 test_fts5_diagnostic() {
   local fakebin out
   fakebin=$(fm_fakebin "$TMP_ROOT/fts5-missing")
@@ -1001,4 +1025,5 @@ test_forged_supervised_mode_does_not_follow_output_symlink
 test_unsafe_source_is_rejected_before_supervisor_file_access
 test_supervisor_revalidates_provenance_and_state_before_commit
 test_supervisor_rolls_back_post_verify_provenance_change
+test_atomic_replace_never_removes_canonical_database
 test_fts5_diagnostic
