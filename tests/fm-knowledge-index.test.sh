@@ -598,6 +598,67 @@ test_commit_provenance_ignores_git_environment_routing() {
   pass "commit provenance ignores caller Git repository routing"
 }
 
+test_registry_replacement_preserves_previous_index() {
+  local race_home="$TMP_ROOT/registry-race-home" source_root="$FIXTURES/registry-race-source"
+  local foreign_root="$FIXTURES/registry-race-foreign" gate="$TMP_ROOT/registry-race-publish"
+  local sync_pid before_sha after_sha out replacement
+  mkdir -p "$race_home/config" "$source_root/records" "$foreign_root/records"
+  printf '# Original\nregistryoriginalcanary\n' > "$source_root/records/source.md"
+  printf '# Foreign\nregistryforeigncanary\n' > "$foreign_root/records/foreign.md"
+  jq -n --arg root "$source_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"registry-race",root:$root,owner:"Original Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" "$CLI" sync --source registry-race --json >/dev/null
+  before_sha=$(sha_of "$race_home/state/knowledge-indexes/registry-race.sqlite3")
+  printf '# Updated\nregistryupdatedcanary\n' > "$source_root/records/source.md"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_PUBLISH="$gate" \
+    "$CLI" sync --source registry-race --json > "$TMP_ROOT/registry-race-sync.out" 2>&1 &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "registry race sync exited before the publish gate"
+    sleep 0.01
+  done
+  replacement="$race_home/config/knowledge-sources.replacement.json"
+  jq -n --arg root "$foreign_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"registry-race",root:$root,owner:"Foreign Owner",privacy:"captain-private",markdown_allow:["records/*.md"],deny:[]}
+    ]}' > "$replacement"
+  mv "$replacement" "$race_home/config/knowledge-sources.json"
+  : > "$gate.release"
+  if wait "$sync_pid"; then
+    fail "sync published after atomic registry replacement"
+  fi
+  after_sha=$(sha_of "$race_home/state/knowledge-indexes/registry-race.sqlite3")
+  [ "$after_sha" = "$before_sha" ] || fail "registry replacement changed the previous database"
+  out=$(FM_HOME="$race_home" "$CLI" search --source registry-race --query registryoriginalcanary --json)
+  assert_result_count "$out" 1 "registry replacement lost the previous index"
+  [ "$(printf '%s' "$out" | jq -r '.results[0].owner')" = "Original Owner" ] \
+    || fail "registry replacement mixed owner provenance into the previous index"
+  out=$(FM_HOME="$race_home" "$CLI" search --source registry-race --query registryforeigncanary --json)
+  assert_result_count "$out" 0 "registry replacement leaked foreign source content"
+  assert_contains "$(cat "$TMP_ROOT/registry-race-sync.out")" 'registry changed before publishing' \
+    "registry replacement did not report a pre-publish failure"
+  pass "sync binds validation and provenance to one registry snapshot"
+}
+
+test_bare_repository_has_no_commit_provenance() {
+  local bare_home="$TMP_ROOT/bare-home" bare_root="$FIXTURES/bare-source" out
+  mkdir -p "$bare_home/config"
+  git init --bare -q "$bare_root"
+  printf '# Bare\nbarecommitcanary\n' > "$bare_root/README.md"
+  jq -n --arg root "$bare_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"bare",root:$root,owner:"Bare Owner",privacy:"repo-private",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$bare_home/config/knowledge-sources.json"
+  FM_HOME="$bare_home" "$CLI" sync --source bare --json >/dev/null
+  out=$(FM_HOME="$bare_home" "$CLI" search --source bare --query barecommitcanary --json)
+  assert_result_count "$out" 1 "bare repository fixture was not indexed"
+  [ "$(printf '%s' "$out" | jq -r '.results[0].commit_sha')" = null ] \
+    || fail "bare repository incorrectly reported commit provenance"
+  pass "bare repositories do not report worktree commit provenance"
+}
+
 test_post_verify_replacement_keeps_identity_provenance() {
   local race_home="$TMP_ROOT/publish-race-home" race_parent="$FIXTURES/publish-race-parent"
   local race_root="$race_parent/source" replacement="$FIXTURES/publish-race-replacement"
@@ -666,5 +727,7 @@ test_directory_replacement_does_not_escape_root
 test_root_replacement_rejects_stale_provenance
 test_commit_provenance_uses_opened_root
 test_commit_provenance_ignores_git_environment_routing
+test_registry_replacement_preserves_previous_index
+test_bare_repository_has_no_commit_provenance
 test_post_verify_replacement_keeps_identity_provenance
 test_fts5_diagnostic

@@ -56,6 +56,8 @@ Registry validation resolves every root fail-closed and requires it to exist and
 Source roots are pairwise disjoint: no root may equal, contain, or be contained by another source root, regardless of registry order.
 Search, status, and removal validate the registry structure and selected source identity without requiring the canonical root to remain online, so a previously built projection remains usable after a failed sync.
 Sync additionally validates every registered physical root and their pairwise separation immediately before reading the selected source.
+Each sync binds schema validation, all registered roots, and every selected-source field to one stable registry snapshot.
+If the registry path changes identity or content before publication, sync fails closed and preserves the previous database byte-for-byte.
 
 ## Built-in safety denies
 
@@ -124,6 +126,7 @@ When several sources are explicitly named, each database is opened independently
 The per-source limit is between 1 and 100 and defaults to 20.
 
 `sync` always builds a complete new database in the index directory and atomically renames it over the old database only after integrity checks pass.
+A registry identity and content check is part of the publication boundary, so a rebuilt database cannot publish from a registry version other than the validated snapshot.
 A failed sync removes only its unpublished temporary files and leaves the previous database byte-for-byte intact.
 Complete rebuild semantics deterministically propagate canonical deletion, rename, and allowlist changes without a watcher or timing promise.
 Repeated unchanged sync produces one row per current relative path and cannot accumulate duplicates.

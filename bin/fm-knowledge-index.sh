@@ -261,13 +261,14 @@ try:
             }
             inside = subprocess.run(
                 ["git", "rev-parse", "--is-inside-work-tree"],
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                text=True,
                 env=git_environment,
             )
             commit = ""
-            if inside.returncode == 0:
+            if inside.returncode == 0 and inside.stdout.strip() == "true":
                 resolved = subprocess.run(
                     ["git", "rev-parse", "--verify", "HEAD^{commit}"],
                     stdout=subprocess.PIPE,
@@ -428,16 +429,88 @@ except OSError:
 PY
 }
 
-publish_database() {
-  local root=$1 identity_file=$2 tmp_db=$3 db=$4
-  python3 - "$root" "$identity_file" "$tmp_db" "$db" <<'PY'
+snapshot_registry() {
+  local snapshot=$1 identity=$2
+  python3 - "$REGISTRY" "$snapshot" "$identity" <<'PY'
+import hashlib
 import json
 import os
+import stat
+import sys
+
+path, snapshot, identity = sys.argv[1:]
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("registry is not a regular file")
+    digest = hashlib.sha256()
+    with open(snapshot, "wb") as output:
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            output.write(chunk)
+    with open(identity, "w", encoding="utf-8") as output:
+        json.dump(
+            {"device": info.st_dev, "inode": info.st_ino, "sha256": digest.hexdigest()},
+            output,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        output.write("\n")
+finally:
+    os.close(fd)
+PY
+}
+
+verify_registry_identity() {
+  local registry=$1 identity=$2
+  python3 - "$registry" "$identity" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+path, identity_path = sys.argv[1:]
+with open(identity_path, encoding="utf-8") as source:
+    expected = json.load(source)
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("registry is not a regular file")
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    if (
+        info.st_dev != expected["device"]
+        or info.st_ino != expected["inode"]
+        or digest.hexdigest() != expected["sha256"]
+    ):
+        raise OSError("registry identity changed")
+finally:
+    os.close(fd)
+PY
+}
+
+publish_database() {
+  local root=$1 identity_file=$2 registry=$3 registry_identity=$4 tmp_db=$5 db=$6
+  python3 - "$root" "$identity_file" "$registry" "$registry_identity" "$tmp_db" "$db" <<'PY'
+import hashlib
+import json
+import os
+import stat
 import sys
 import time
 
 try:
-    root, identity_file, temporary, destination = sys.argv[1:]
+    root, identity_file, registry, registry_identity, temporary, destination = sys.argv[1:]
     with open(identity_file, "r", encoding="ascii") as identity:
         payload = json.load(identity)
     expected = (int(payload["device"]), int(payload["inode"]))
@@ -461,6 +534,27 @@ try:
         open(gate + ".ready", "w", encoding="utf-8").close()
         while not os.path.exists(gate + ".release"):
             time.sleep(0.01)
+    with open(registry_identity, encoding="utf-8") as source:
+        expected_registry = json.load(source)
+    registry_fd = os.open(registry, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        registry_stat = os.fstat(registry_fd)
+        if not stat.S_ISREG(registry_stat.st_mode):
+            raise OSError("registry is not a regular file")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(registry_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if (
+            registry_stat.st_dev != expected_registry["device"]
+            or registry_stat.st_ino != expected_registry["inode"]
+            or digest.hexdigest() != expected_registry["sha256"]
+        ):
+            raise OSError("registry identity changed")
+    finally:
+        os.close(registry_fd)
     os.chmod(temporary, 0o600)
     os.replace(temporary, destination)
     os.chmod(destination, 0o600)
@@ -589,11 +683,19 @@ command_sync() {
   local id=$1 root owner privacy repo commit indexed_at db tmp_db lines manifest file_list
   local rel physical sha count manifest_sql integrity allows_json denies_json
   local snapshot_dir snapshot root_identity commit_file root_device root_inode
+  local original_registry registry_snapshot registry_identity
   local -a allows=() denies=()
+  original_registry=$REGISTRY
+  ensure_index_dir
+  registry_snapshot=$(mktemp "$INDEX_DIR/.knowledge-registry.XXXXXX")
+  registry_identity=$(mktemp "$INDEX_DIR/.knowledge-registry-identity.XXXXXX")
+  TEMP_FILES+=("$registry_snapshot" "$registry_identity")
+  snapshot_registry "$registry_snapshot" "$registry_identity" \
+    || die "cannot safely snapshot registry; previous index preserved"
+  REGISTRY=$registry_snapshot
   validate_registry_structure
   validate_source_id "$id"
   validate_all_roots
-  ensure_index_dir
   root=$(source_field "$id" root)
   owner=$(source_field "$id" owner)
   privacy=$(source_field "$id" privacy)
@@ -760,7 +862,9 @@ SQL
     done
   fi
   db=$(database_path "$id")
-  publish_database "$root" "$root_identity" "$tmp_db" "$db" \
+  verify_registry_identity "$original_registry" "$registry_identity" \
+    || die "registry changed before publishing $id; previous index preserved"
+  publish_database "$root" "$root_identity" "$original_registry" "$registry_identity" "$tmp_db" "$db" \
     || die "source root changed before publishing $id; previous index preserved"
   if [ "$JSON" -eq 1 ]; then
     jq -cn \
