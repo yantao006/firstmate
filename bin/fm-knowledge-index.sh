@@ -225,17 +225,18 @@ validate_all_roots() {
 }
 
 snapshot_source_tree() {
-  local root=$1 allows_json=$2 denies_json=$3 snapshot_dir=$4 file_list=$5 identity_file=$6
-  python3 - "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" "$identity_file" <<'PY'
+  local root=$1 allows_json=$2 denies_json=$3 snapshot_dir=$4 file_list=$5 identity_file=$6 commit_file=$7
+  python3 - "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" "$identity_file" "$commit_file" <<'PY'
 import fnmatch
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 
 try:
-    root, allows_json, denies_json, snapshot_dir, file_list, identity_file = sys.argv[1:]
+    root, allows_json, denies_json, snapshot_dir, file_list, identity_file, commit_file = sys.argv[1:]
     allows = json.loads(allows_json)
     denies = json.loads(denies_json)
     directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
@@ -250,6 +251,32 @@ try:
             directory_fd = next_fd
 
         root_stat = os.fstat(directory_fd)
+        saved_cwd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fchdir(directory_fd)
+            inside = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            commit = ""
+            if inside.returncode == 0:
+                resolved = subprocess.run(
+                    ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    text=True,
+                )
+                candidate = resolved.stdout.strip()
+                if resolved.returncode == 0 and candidate and all(
+                    character in "0123456789abcdefABCDEF" for character in candidate
+                ):
+                    commit = candidate
+        finally:
+            os.fchdir(saved_cwd)
+            os.close(saved_cwd)
 
         candidates = []
 
@@ -374,9 +401,19 @@ try:
             os.close(verification_fd)
 
         with open(identity_file, "w", encoding="ascii") as identity:
-            identity.write(f"{root_stat.st_dev} {root_stat.st_ino}\n")
+            json.dump(
+                {"device": root_stat.st_dev, "inode": root_stat.st_ino},
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            identity.write("\n")
             identity.flush()
             os.fsync(identity.fileno())
+        with open(commit_file, "w", encoding="ascii") as output:
+            output.write(commit + "\n")
+            output.flush()
+            os.fsync(output.fileno())
     finally:
         os.close(directory_fd)
 except OSError:
@@ -384,18 +421,19 @@ except OSError:
 PY
 }
 
-verify_source_root_identity() {
-  local root=$1 identity_file=$2
-  python3 - "$root" "$identity_file" <<'PY'
+publish_database() {
+  local root=$1 identity_file=$2 tmp_db=$3 db=$4
+  python3 - "$root" "$identity_file" "$tmp_db" "$db" <<'PY'
+import json
 import os
 import sys
+import time
 
 try:
-    root, identity_file = sys.argv[1:]
+    root, identity_file, temporary, destination = sys.argv[1:]
     with open(identity_file, "r", encoding="ascii") as identity:
-        expected = tuple(int(value) for value in identity.read().split())
-    if len(expected) != 2:
-        raise OSError("invalid source root identity")
+        payload = json.load(identity)
+    expected = (int(payload["device"]), int(payload["inode"]))
     directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in root.split("/")[1:]:
@@ -411,7 +449,15 @@ try:
             raise OSError("registered source root no longer matches snapshot")
     finally:
         os.close(directory_fd)
-except (OSError, ValueError):
+    gate = os.environ.get("FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_IDENTITY_VERIFY")
+    if gate:
+        open(gate + ".ready", "w", encoding="utf-8").close()
+        while not os.path.exists(gate + ".release"):
+            time.sleep(0.01)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+    os.chmod(destination, 0o600)
+except (KeyError, OSError, TypeError, ValueError):
     sys.exit(1)
 PY
 }
@@ -535,7 +581,7 @@ command_validate() {
 command_sync() {
   local id=$1 root owner privacy repo commit indexed_at db tmp_db lines manifest file_list
   local rel physical sha count manifest_sql integrity allows_json denies_json
-  local snapshot_dir snapshot root_identity
+  local snapshot_dir snapshot root_identity commit_file root_device root_inode
   local -a allows=() denies=()
   validate_registry_structure
   validate_source_id "$id"
@@ -545,11 +591,6 @@ command_sync() {
   owner=$(source_field "$id" owner)
   privacy=$(source_field "$id" privacy)
   repo=$(source_repo "$id")
-  commit=""
-  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    commit=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)
-    case "$commit" in ''|*[!0-9a-fA-F]*) commit="" ;; esac
-  fi
   indexed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   while IFS= read -r pattern; do allows+=("$pattern"); done \
     < <(jq -r --arg id "$id" '.sources[] | select(.id == $id) | .markdown_allow[]' "$REGISTRY")
@@ -562,13 +603,19 @@ command_sync() {
   manifest=$(mktemp "$INDEX_DIR/.knowledge-manifest.XXXXXX")
   file_list=$(mktemp "$INDEX_DIR/.knowledge-files.XXXXXX")
   root_identity=$(mktemp "$INDEX_DIR/.knowledge-root-identity.XXXXXX")
+  commit_file=$(mktemp "$INDEX_DIR/.knowledge-commit.XXXXXX")
   tmp_db=$(mktemp "$INDEX_DIR/.$id.sqlite3.tmp.XXXXXX")
   snapshot_dir=$(mktemp -d "$INDEX_DIR/.knowledge-snapshot.XXXXXX")
-  TEMP_FILES+=("$lines" "$manifest" "$file_list" "$root_identity" "$tmp_db")
+  TEMP_FILES+=("$lines" "$manifest" "$file_list" "$root_identity" "$commit_file" "$tmp_db")
   TEMP_DIRS+=("$snapshot_dir")
 
-  snapshot_source_tree "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" "$root_identity" \
+  snapshot_source_tree "$root" "$allows_json" "$denies_json" "$snapshot_dir" "$file_list" "$root_identity" "$commit_file" \
     || die "cannot safely snapshot source tree for $id; previous index preserved"
+  commit=$(tr -d '\n' < "$commit_file")
+  root_device=$(jq -er '.device' "$root_identity") \
+    || die "cannot read source root identity for $id; previous index preserved"
+  root_inode=$(jq -er '.inode' "$root_identity") \
+    || die "cannot read source root identity for $id; previous index preserved"
 
   while IFS= read -r -d '' rel && IFS= read -r -d '' snapshot; do
     safe_relative_path "$rel" || die "unsafe relative path under $id"
@@ -592,6 +639,8 @@ command_sync() {
     --arg source_root "$root" \
     --arg repo "$repo" \
     --arg commit "$commit" \
+    --argjson root_device "$root_device" \
+    --argjson root_inode "$root_inode" \
     --arg indexed_at "$indexed_at" \
     --slurpfile documents "$lines" \
     '{
@@ -601,6 +650,8 @@ command_sync() {
       source_root:$source_root,
       repo:$repo,
       commit:$commit,
+      root_device:$root_device,
+      root_inode:$root_inode,
       indexed_at:$indexed_at,
       documents:($documents | sort_by(.relative_path))
     }' > "$manifest"
@@ -634,6 +685,8 @@ CREATE TABLE documents (
   source_root TEXT NOT NULL,
   repo_identity TEXT,
   commit_sha TEXT,
+  source_root_device INTEGER NOT NULL,
+  source_root_inode INTEGER NOT NULL,
   content_sha256 TEXT NOT NULL,
   indexed_at TEXT NOT NULL,
   content TEXT NOT NULL
@@ -653,10 +706,13 @@ UNION ALL SELECT 'privacy_class', json_extract(payload, '$.privacy') FROM manife
 UNION ALL SELECT 'source_root', json_extract(payload, '$.source_root') FROM manifest_input
 UNION ALL SELECT 'repo_identity', COALESCE(json_extract(payload, '$.repo'), '') FROM manifest_input
 UNION ALL SELECT 'commit_sha', COALESCE(json_extract(payload, '$.commit'), '') FROM manifest_input
+UNION ALL SELECT 'source_root_device', json_extract(payload, '$.root_device') FROM manifest_input
+UNION ALL SELECT 'source_root_inode', json_extract(payload, '$.root_inode') FROM manifest_input
 UNION ALL SELECT 'indexed_at', json_extract(payload, '$.indexed_at') FROM manifest_input;
 INSERT INTO documents(
   relative_path, absolute_path, source_id, owner, privacy_class,
-  source_root, repo_identity, commit_sha, content_sha256, indexed_at, content
+  source_root, repo_identity, commit_sha, source_root_device, source_root_inode,
+  content_sha256, indexed_at, content
 )
 SELECT
   json_extract(document.value, '$.relative_path'),
@@ -667,6 +723,8 @@ SELECT
   json_extract(manifest.payload, '$.source_root'),
   NULLIF(json_extract(manifest.payload, '$.repo'), ''),
   NULLIF(json_extract(manifest.payload, '$.commit'), ''),
+  json_extract(manifest.payload, '$.root_device'),
+  json_extract(manifest.payload, '$.root_inode'),
   json_extract(document.value, '$.content_sha256'),
   json_extract(manifest.payload, '$.indexed_at'),
   CAST(readfile(json_extract(document.value, '$.content_path')) AS TEXT)
@@ -694,12 +752,9 @@ SQL
       sleep 0.01
     done
   fi
-  verify_source_root_identity "$root" "$root_identity" \
-    || die "source root changed before publishing $id; previous index preserved"
-  chmod 600 "$tmp_db"
   db=$(database_path "$id")
-  mv -f -- "$tmp_db" "$db"
-  chmod 600 "$db"
+  publish_database "$root" "$root_identity" "$tmp_db" "$db" \
+    || die "source root changed before publishing $id; previous index preserved"
   if [ "$JSON" -eq 1 ]; then
     jq -cn \
       --arg source "$id" --arg database "$db" --arg indexed_at "$indexed_at" \
@@ -766,6 +821,8 @@ command_search() {
          d.absolute_path,
          d.repo_identity,
          d.commit_sha,
+         d.source_root_device,
+         d.source_root_inode,
          d.content_sha256,
          d.indexed_at,
          d.source_root,
@@ -793,7 +850,7 @@ command_search() {
   else
     printf '%s' "$results_json" | jq -r '.[] |
       "[\(.source_id)] \(.relative_path) | owner=\(.owner) privacy=\(.privacy_class)",
-      "  root=\(.source_root) repo=\(.repo_identity // "-") commit=\(.commit_sha // "-") sha256=\(.content_sha256) indexed=\(.indexed_at)",
+      "  root=\(.source_root) identity=\(.source_root_device):\(.source_root_inode) repo=\(.repo_identity // "-") commit=\(.commit_sha // "-") sha256=\(.content_sha256) indexed=\(.indexed_at)",
       "  \(.snippet | gsub("[\\r\\n]+"; " "))"'
   fi
 }

@@ -526,6 +526,84 @@ test_root_replacement_rejects_stale_provenance() {
   pass "root replacement rejects stale provenance and preserves the previous index"
 }
 
+test_commit_provenance_uses_opened_root() {
+  local race_home="$TMP_ROOT/commit-race-home" race_parent="$FIXTURES/commit-race-parent"
+  local race_root="$race_parent/source" replacement="$FIXTURES/commit-race-replacement"
+  local gate="$TMP_ROOT/commit-race-snapshot" sync_pid before_sha after_sha original_commit
+  mkdir -p "$race_home/config" "$race_root/records" "$replacement/records"
+  printf '# Original\ncommitrootoriginalcanary\n' > "$race_root/records/race.md"
+  git -C "$race_root" init -q
+  git -C "$race_root" add records/race.md
+  git -C "$race_root" -c user.name=Test -c user.email=test@example.invalid commit -qm original
+  original_commit=$(git -C "$race_root" rev-parse HEAD)
+  printf '# Replacement\ncommitrootreplacementcanary\n' > "$replacement/records/race.md"
+  git -C "$replacement" init -q
+  git -C "$replacement" add records/race.md
+  git -C "$replacement" -c user.name=Test -c user.email=test@example.invalid commit -qm replacement
+  jq -n --arg root "$race_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"commit-race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" "$CLI" sync --source commit-race --json >/dev/null
+  before_sha=$(sha_of "$race_home/state/knowledge-indexes/commit-race.sqlite3")
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_BEFORE_SNAPSHOT="$gate" \
+    "$CLI" sync --source commit-race --json > "$TMP_ROOT/commit-race-sync.out" 2>&1 &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "commit race sync exited before reaching the snapshot gate"
+    sleep 0.01
+  done
+  mv "$race_parent" "$FIXTURES/commit-race-parent-original"
+  mkdir -p "$race_parent"
+  cp -R "$replacement" "$race_root"
+  : > "$gate.release"
+  if wait "$sync_pid"; then
+    fail "commit race published after replacing the opened root"
+  fi
+  after_sha=$(sha_of "$race_home/state/knowledge-indexes/commit-race.sqlite3")
+  [ "$after_sha" = "$before_sha" ] || fail "commit race changed the previous database"
+  [ "$(sqlite3 -readonly "$race_home/state/knowledge-indexes/commit-race.sqlite3" \
+    "SELECT value FROM metadata WHERE key = 'commit_sha';")" = "$original_commit" ] \
+    || fail "commit provenance did not come from the opened source root"
+  pass "commit provenance stays bound to the opened source root"
+}
+
+test_post_verify_replacement_keeps_identity_provenance() {
+  local race_home="$TMP_ROOT/publish-race-home" race_parent="$FIXTURES/publish-race-parent"
+  local race_root="$race_parent/source" replacement="$FIXTURES/publish-race-replacement"
+  local gate="$TMP_ROOT/publish-race-verified" sync_pid original_device original_inode out
+  mkdir -p "$race_home/config" "$race_root/records" "$replacement/records"
+  printf '# Original\npublishidentityoriginalcanary\n' > "$race_root/records/race.md"
+  printf '# Replacement\npublishidentityreplacementcanary\n' > "$replacement/records/race.md"
+  original_device=$(stat -f '%d' "$race_root" 2>/dev/null || stat -c '%d' "$race_root")
+  original_inode=$(stat -f '%i' "$race_root" 2>/dev/null || stat -c '%i' "$race_root")
+  jq -n --arg root "$race_root" \
+    '{schema:"firstmate.knowledge-sources.v1",sources:[
+      {id:"publish-race",root:$root,owner:"Race Owner",privacy:"public",markdown_allow:["*.md"],deny:[]}
+    ]}' > "$race_home/config/knowledge-sources.json"
+  FM_HOME="$race_home" FM_KNOWLEDGE_INDEX_TEST_PAUSE_AFTER_IDENTITY_VERIFY="$gate" \
+    "$CLI" sync --source publish-race --json > "$TMP_ROOT/publish-race-sync.out" 2>&1 &
+  sync_pid=$!
+  while [ ! -e "$gate.ready" ]; do
+    kill -0 "$sync_pid" 2>/dev/null || fail "publish race sync exited before identity verification"
+    sleep 0.01
+  done
+  mv "$race_parent" "$FIXTURES/publish-race-parent-original"
+  mkdir -p "$race_parent"
+  cp -R "$replacement" "$race_root"
+  : > "$gate.release"
+  wait "$sync_pid" || fail "publish race failed despite stable opened-root provenance"
+  out=$(FM_HOME="$race_home" "$CLI" search --source publish-race --query publishidentityoriginalcanary --json)
+  assert_result_count "$out" 1 "publish race lost content from the opened root"
+  [ "$(printf '%s' "$out" | jq -r '.results[0].source_root_device')" = "$original_device" ] \
+    || fail "publish race reported the replacement root device"
+  [ "$(printf '%s' "$out" | jq -r '.results[0].source_root_inode')" = "$original_inode" ] \
+    || fail "publish race reported the replacement root inode"
+  out=$(FM_HOME="$race_home" "$CLI" search --source publish-race --query publishidentityreplacementcanary --json)
+  assert_result_count "$out" 0 "publish race indexed replacement-root content"
+  pass "post-verification replacement retains accurate opened-root provenance"
+}
+
 test_fts5_diagnostic() {
   local fakebin out
   fakebin=$(fm_fakebin "$TMP_ROOT/fts5-missing")
@@ -556,4 +634,6 @@ test_sync_remove_source_coordination
 test_registry_path_traversal_and_root_rejection
 test_directory_replacement_does_not_escape_root
 test_root_replacement_rejects_stale_provenance
+test_commit_provenance_uses_opened_root
+test_post_verify_replacement_keeps_identity_provenance
 test_fts5_diagnostic

@@ -70,8 +70,9 @@ They cannot remove or override these built-in denies:
 Only regular files whose names end in `.md` or `.markdown` are candidates.
 Directory and file symlinks are not followed.
 Sync opens the canonical root from the filesystem root one component at a time without following symlinks, then binds enumeration and every candidate read to that single directory descriptor.
-The snapshot records that opened directory's filesystem identity and reopens the registered path without following symlinks after copying and immediately before publication.
-If the registered path no longer names the opened directory, sync fails closed and preserves the previous database, so stored canonical paths cannot describe content read from a renamed tree.
+The snapshot records that opened directory's filesystem device and inode identity and obtains Git commit provenance while its process is positioned in that same opened directory.
+Publication reopens the registered path without following symlinks and fails closed when it no longer names the opened directory at commit time.
+The filesystem identity remains attached to every result because POSIX pathnames do not provide a lease against a cooperating process renaming an ancestor after that check.
 Every candidate must remain below that opened root, match at least one allow pattern, and match neither a built-in nor configured deny.
 
 ## Index storage and schema
@@ -90,12 +91,13 @@ Every document persists:
 - source ID;
 - owner;
 - privacy class;
-- source-relative and canonical absolute paths;
+- source-relative paths and the registered canonical absolute locator at snapshot time;
+- source-root filesystem device and inode identity for the directory tree actually read;
 - optional repository identity;
 - full Git commit SHA when the root is inside a Git worktree;
 - content SHA-256;
 - one UTC indexed timestamp for the completed sync;
-- canonical source root;
+- registered canonical source-root locator at snapshot time;
 - Markdown content.
 
 Search SQL is fixed and uses a bound FTS query parameter.
