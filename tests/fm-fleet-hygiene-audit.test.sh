@@ -247,6 +247,6 @@ assert_not_contains "$out" 'fm-fleet-hygiene-audit: wrote' 'report copy failure 
 pass 'write failures return nonzero without reporting success'
 
 skill="$ROOT/.agents/skills/fleet-hygiene/SKILL.md"
-assert_grep 'Add `--check-prs` only when the captain explicitly requests PR checks.' "$skill" 'skill does not keep PR checks opt-in'
+assert_grep "Add \`--check-prs\` only when the captain explicitly requests PR checks." "$skill" 'skill does not keep PR checks opt-in'
 assert_not_contains "$(cat "$skill")" '## Safety boundary' 'skill restates policy outside the tracked docs owner'
 pass 'skill keeps policy ownership in docs and PR checks opt-in'
