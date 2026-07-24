@@ -37,7 +37,7 @@ Dirty, unmerged, live, orphan, retained-by-quota, and below-threshold slots rema
 ## Layer B - stale projects
 
 Layer B identifies projects from `data/projects.md` and local `projects/<name>` clones, including research repositories with no Beads records.
-The stale clock uses the oldest age among available project activity sources: project Beads activity when detectable, the local clone's latest commit or directory mtime fallback, and matching `data/docs/<name>*` activity.
+The stale clock uses the minimum age among available project activity sources: project Beads activity when detectable, the local clone's latest commit or directory mtime fallback, and matching `data/docs/<name>*` activity.
 A project at least 30 days stale enters the candidate list only after the hard exclusions are applied.
 A project 30 through 44 days stale is listed for observation and is not prechecked.
 A project at least 45 days stale is prechecked for tier 2 only when all required safety evidence is clear.

@@ -28,9 +28,15 @@ set_tree_age() {
 }
 
 new_slot() {
-  local pool=$1 slot=$2 age_seconds=$3 path
+  local pool=$1 slot=$2 age_seconds=$3 path remote branch
   path="$TREEHOUSE/$pool/$slot"
+  remote="$TMP_ROOT/slot-remotes/$pool-$slot.git"
   fm_git_init_commit "$path"
+  mkdir -p "$TMP_ROOT/slot-remotes"
+  git clone --quiet --bare "$path" "$remote"
+  git -C "$path" remote add origin "$remote"
+  branch=$(git -C "$path" symbolic-ref --short HEAD)
+  git -C "$path" push -q -u origin "$branch"
   set_tree_age "$path" "$age_seconds"
 }
 
@@ -40,7 +46,9 @@ path=${!#}
 case "$(basename "$path")" in
   age-small) kib=51200 ;;
   age-large) kib=2097152 ;;
-  size-oldest|size-middle|size-newest|live-size-old|live-size-new|single-size) kib=1572864 ;;
+  size-oldest|size-middle|size-newest|live-size-old|live-size-new|single-size|tie-middle) kib=1572864 ;;
+  tie-small) kib=1048576 ;;
+  tie-large) kib=2097152 ;;
   *) kib=10240 ;;
 esac
 printf '%s\t%s\n' "$kib" "$path"
@@ -57,6 +65,14 @@ new_slot pool-live live-size-new 86400
 mkdir -p "$TREEHOUSE/pool-live/live-slot/repository"
 set_tree_age "$TREEHOUSE/pool-live/live-slot" 3600
 new_slot pool-single single-size 86400
+new_slot pool-tie tie-small 86400
+new_slot pool-tie tie-middle 86400
+new_slot pool-tie tie-large 86400
+new_slot pool-remote remote-contained 604800
+git -C "$TREEHOUSE/pool-remote/remote-contained" branch --unset-upstream
+mkdir -p "$TREEHOUSE/pool-protected/no-upstream"
+fm_git_init_commit "$TREEHOUSE/pool-protected/no-upstream"
+set_tree_age "$TREEHOUSE/pool-protected/no-upstream" 604800
 
 cat > "$HOME_DIR/state/live.meta" <<EOF
 worktree=$TREEHOUSE/pool-live/live-slot/repository
@@ -82,6 +98,11 @@ assert_contains "$out" '| live | live meta worktree |' 'live metadata is a hard 
 assert_contains "$out" '| [x] | pool-live | live-size-old |' 'live slot counts toward two remaining slots'
 assert_not_contains "$out" '| [x] | pool-live | live-size-new |' 'newer Size slot is retained beside live slot'
 assert_not_contains "$out" '| [x] | pool-single | single-size |' 'single young large slot is retained'
+assert_contains "$out" '| [x] | pool-tie | tie-small |' 'Size selects the smaller slot when candidate ages tie'
+assert_not_contains "$out" '| [x] | pool-tie | tie-large |' 'Size retains the larger slot when candidate ages tie'
+assert_contains "$out" '| [x] | pool-remote | remote-contained |' 'remote containment proves a no-upstream slot is disposable'
+assert_not_contains "$out" '| [x] | pool-protected | no-upstream |' 'a default branch without upstream or remote containment is protected'
+assert_contains "$out" '| unmerged | unmerged commits |' 'uncertain no-upstream work remains visible in the appendix'
 pass 'Layer A applies Age/Size OR, Size keep-two, and live metadata exclusion'
 
 new_project() {
@@ -111,6 +132,8 @@ for spec in \
   'inflight 60' \
   'queued 60' \
   'decision 60' \
+  'decisionunknown 60' \
+  'activity 60' \
   'adcue 90'; do
   # shellcheck disable=SC2086
   new_project $spec
@@ -127,6 +150,8 @@ cat > "$HOME_DIR/data/projects.md" <<'EOF'
 - inflight [no-mistakes] - active fixture
 - queued [no-mistakes] - queued fixture
 - decision [no-mistakes] - decision fixture
+- decisionunknown [no-mistakes] - unknown decision fixture
+- activity [no-mistakes] - recent docs fixture
 - adcue [no-mistakes] - whitelist fixture
 EOF
 cat > "$HOME_DIR/data/backlog.md" <<'EOF'
@@ -141,6 +166,10 @@ cat > "$HOME_DIR/data/backlog.md" <<'EOF'
 
 ## Done
 EOF
+mkdir -p "$HOME_DIR/projects/decisionunknown/.beads" "$HOME_DIR/data/docs"
+printf '.beads/\n' >> "$HOME_DIR/projects/decisionunknown/.git/info/exclude"
+printf 'recent project activity\n' > "$HOME_DIR/data/docs/activity-note.md"
+set_tree_age "$HOME_DIR/data/docs/activity-note.md" 432000
 cat > "$HOME_DIR/state/active.meta" <<EOF
 worktree=$TMP_ROOT/active-worktree
 project=inflight
@@ -164,6 +193,12 @@ esac
 SH
 chmod +x "$FAKEBIN/gh-axi"
 
+cat > "$FAKEBIN/bd" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$FAKEBIN/bd"
+
 out=$(run_audit --check-prs)
 assert_contains "$out" '| [ ] | thirty | 30 days | observe | stale 30-44 days |' '30-day project enters observation list'
 assert_contains "$out" '| [x] | fortyfive | 45 days | 2 |' '45-day clear project is prechecked for tier 2'
@@ -175,6 +210,10 @@ assert_contains "$out" 'unknown (PR check failed)' 'failed PR check is reported 
 assert_contains "$out" '| inflight | 60 days | hard excluded |' 'in-flight project is hard excluded'
 assert_contains "$out" '| queued | 60 days | hard excluded | queued ship/docs work |' 'queued project is hard excluded'
 assert_contains "$out" '| decision | 60 days | hard excluded | open captain decision |' 'open decision is hard excluded'
+assert_contains "$out" '| [ ] | decisionunknown | 60 days | 2 |' 'unknown Beads decision status prevents a tier 2 precheck'
+assert_contains "$out" 'Beads decision status unknown' 'failed decision evidence is reported as unknown'
+assert_not_contains "$out" '| [x] | activity |' 'recent documentation activity prevents a stale precheck'
+assert_contains "$out" '| activity | 5 days | below stale threshold |' 'stale clock uses the youngest available activity age'
 assert_contains "$out" '| adcue | 90 days | hard excluded | static or configured whitelist |' 'static whitelist is hard excluded'
 pass 'Layer B applies 30/45 thresholds and hard exclusions'
 
@@ -206,3 +245,8 @@ rc=$?
 assert_contains "$out" 'could not write' 'report copy failure is not reported'
 assert_not_contains "$out" 'fm-fleet-hygiene-audit: wrote' 'report copy failure reported a successful write'
 pass 'write failures return nonzero without reporting success'
+
+skill="$ROOT/.agents/skills/fleet-hygiene/SKILL.md"
+assert_grep 'Add `--check-prs` only when the captain explicitly requests PR checks.' "$skill" 'skill does not keep PR checks opt-in'
+assert_not_contains "$(cat "$skill")" '## Safety boundary' 'skill restates policy outside the tracked docs owner'
+pass 'skill keeps policy ownership in docs and PR checks opt-in'

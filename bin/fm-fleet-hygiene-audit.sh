@@ -187,10 +187,6 @@ slot_class() {
     return
   fi
   branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-  if [ "$branch" = main ] || [ "$branch" = master ]; then
-    printf 'disposable\n'
-    return
-  fi
   if git -C "$repo" branch -r --contains HEAD 2>/dev/null | grep -q .; then
     printf 'disposable\n'
   elif [ -z "$branch" ]; then
@@ -254,7 +250,7 @@ cut -f1 "$A_ALL" | LC_ALL=C sort -u | while IFS= read -r pool; do
   [ "$limit" -ge 0 ] || limit=0
   selected=0
   awk -F '\t' -v p="$pool" '$1==p && $4=="disposable" && $5<604800 && $7>=1048576' "$A_ALL" \
-    | LC_ALL=C sort -t $'\t' -k5,5nr -k7,7nr -k3,3 \
+    | LC_ALL=C sort -t $'\t' -k5,5nr -k7,7n -k3,3 \
     | while IFS=$'\t' read -r p s path class age_seconds age_days size_kib; do
         if [ "$selected" -lt "$limit" ]; then
           printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tSize\n' \
@@ -367,9 +363,12 @@ backlog_flags() {
 open_beads_decision() {
   local repo=$1 out
   [ -d "$repo/.beads" ] || return 1
-  command -v bd >/dev/null 2>&1 || return 1
+  command -v bd >/dev/null 2>&1 || return 2
   out=$(bd --readonly -C "$repo" list --status open,in_progress,blocked,deferred --type decision --json --limit 1 2>/dev/null) || return 2
-  printf '%s' "$out" | grep -q '"id"'
+  if printf '%s' "$out" | grep -q '"id"'; then
+    return 0
+  fi
+  return 1
 }
 
 iso_epoch() {
@@ -450,23 +449,30 @@ clone_safety() {
 }
 
 project_age() {
-  local project=$1 repo="$FM_HOME/projects/$1" newest age max_age=0 found=0 item mtime commit beads_epoch
+  local project=$1 repo="$FM_HOME/projects/$1" newest age min_age=0 found=0 item mtime commit beads_epoch
   if [ -d "$repo" ]; then
     if command -v git >/dev/null 2>&1 && git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       commit=$(git -C "$repo" log -1 --format=%ct 2>/dev/null || true)
       case "$commit" in
         ''|*[!0-9]*) ;;
-        *) age=$((NOW - commit)); [ "$age" -ge 0 ] || age=0; max_age=$age; found=1 ;;
+        *) age=$((NOW - commit)); [ "$age" -ge 0 ] || age=0; min_age=$age; found=1 ;;
       esac
     fi
     beads_epoch=$(beads_activity_epoch "$repo" || true)
     case "$beads_epoch" in
       ''|*[!0-9]*) ;;
-      *) age=$((NOW - beads_epoch)); [ "$age" -ge 0 ] || age=0; [ "$age" -le "$max_age" ] || max_age=$age; found=1 ;;
+      *)
+        age=$((NOW - beads_epoch))
+        [ "$age" -ge 0 ] || age=0
+        if [ "$found" -eq 0 ] || [ "$age" -lt "$min_age" ]; then
+          min_age=$age
+        fi
+        found=1
+        ;;
     esac
     if [ "$found" -eq 0 ]; then
       mtime=$(stat_mtime "$repo" || printf '%s' "$NOW")
-      age=$((NOW - mtime)); [ "$age" -ge 0 ] || age=0; max_age=$age; found=1
+      age=$((NOW - mtime)); [ "$age" -ge 0 ] || age=0; min_age=$age; found=1
     fi
   fi
   newest=0
@@ -479,14 +485,16 @@ project_age() {
   fi
   if [ "$newest" -gt 0 ]; then
     age=$((NOW - newest)); [ "$age" -ge 0 ] || age=0
-    [ "$age" -le "$max_age" ] || max_age=$age
+    if [ "$found" -eq 0 ] || [ "$age" -lt "$min_age" ]; then
+      min_age=$age
+    fi
     found=1
   fi
   if [ "$found" -eq 0 ] && [ -f "$FM_HOME/data/projects.md" ]; then
     mtime=$(stat_mtime "$FM_HOME/data/projects.md" || printf '%s' "$NOW")
-    max_age=$((NOW - mtime)); [ "$max_age" -ge 0 ] || max_age=0
+    min_age=$((NOW - mtime)); [ "$min_age" -ge 0 ] || min_age=0
   fi
-  printf '%s\n' "$((max_age / 86400))"
+  printf '%s\n' "$((min_age / 86400))"
 }
 
 while IFS= read -r project; do
