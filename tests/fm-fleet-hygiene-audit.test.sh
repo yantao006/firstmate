@@ -87,14 +87,15 @@ run_audit() {
 
 out=$(run_audit)
 assert_contains "$out" '| [x] | pool-a | age-small |' 'Age accepts a small slot at exactly seven days'
+assert_contains "$out" '| 可安全处置 | 按时间 |' 'candidate class and route labels are Chinese'
 assert_contains "$out" '| [x] | pool-a | age-large |' 'Age accepts a large old slot without quota'
 assert_contains "$out" '| [x] | pool-a | size-oldest |' 'Size selects the oldest young large slot within quota'
 assert_not_contains "$out" '| [x] | pool-a | size-middle |' 'Size keep-two retains a newer slot'
 assert_not_contains "$out" '| [x] | pool-a | size-newest |' 'Size keep-two retains the newest slot'
 assert_contains "$out" '| pool-a | size-middle |' 'retained Size slot remains in appendix'
-assert_contains "$out" 'retained by Size keep-2' 'appendix names the Size quota'
+assert_contains "$out" '因大小路径每池保留 2 个槽位' 'appendix names the Size quota in Chinese'
 assert_contains "$out" '| pool-live | live-slot |' 'live slot remains visible in appendix'
-assert_contains "$out" '| live | live meta worktree |' 'live metadata is a hard exclusion'
+assert_contains "$out" '| 使用中 | 被运行中任务引用 |' 'live metadata is a hard exclusion with Chinese presentation'
 assert_contains "$out" '| [x] | pool-live | live-size-old |' 'live slot counts toward two remaining slots'
 assert_not_contains "$out" '| [x] | pool-live | live-size-new |' 'newer Size slot is retained beside live slot'
 assert_not_contains "$out" '| [x] | pool-single | single-size |' 'single young large slot is retained'
@@ -102,8 +103,19 @@ assert_contains "$out" '| [x] | pool-tie | tie-small |' 'Size selects the smalle
 assert_not_contains "$out" '| [x] | pool-tie | tie-large |' 'Size retains the larger slot when candidate ages tie'
 assert_contains "$out" '| [x] | pool-remote | remote-contained |' 'remote containment proves a no-upstream slot is disposable'
 assert_not_contains "$out" '| [x] | pool-protected | no-upstream |' 'a default branch without upstream or remote containment is protected'
-assert_contains "$out" '| unmerged | unmerged commits |' 'uncertain no-upstream work remains visible in the appendix'
+assert_contains "$out" '| 有未合并提交 | 存在未合并提交 |' 'uncertain no-upstream work remains visible in the Chinese appendix'
 pass 'Layer A applies Age/Size OR, Size keep-two, and live metadata exclusion'
+
+EMPTY_HOME="$TMP_ROOT/empty-home"
+EMPTY_TREEHOUSE="$TMP_ROOT/empty-treehouse"
+mkdir -p "$EMPTY_HOME/state" "$EMPTY_HOME/data" "$EMPTY_HOME/projects" "$EMPTY_TREEHOUSE"
+out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$EMPTY_HOME" FM_TREEHOUSE_ROOT="$EMPTY_TREEHOUSE" \
+  FM_HYGIENE_NOW_EPOCH="$NOW" "$ROOT/bin/fm-fleet-hygiene-audit.sh")
+assert_contains "$out" '没有可安全处置的候选项' 'Layer A candidate empty state is Chinese'
+assert_contains "$out" '没有通过强制排除检查的闲置项目' 'Layer B candidate empty state is Chinese'
+assert_contains "$out" '没有已排除或因配额保留的槽位' 'Layer A appendix empty state is Chinese'
+assert_contains "$out" '没有已排除或未达到阈值的项目' 'Layer B appendix empty state is Chinese'
+pass 'empty report rows are captain-facing Chinese'
 
 new_project() {
   local name=$1 days=$2 repo remote branch commit_epoch
@@ -200,30 +212,32 @@ SH
 chmod +x "$FAKEBIN/bd"
 
 out=$(run_audit --check-prs)
-assert_contains "$out" '| [ ] | thirty | 30 days | observe | stale 30-44 days |' '30-day project enters observation list'
-assert_contains "$out" '| [x] | fortyfive | 45 days | 2 |' '45-day clear project is prechecked for tier 2'
+assert_contains "$out" '| [ ] | thirty | 30 天 | 观察 | 已闲置 30 至 44 天 |' '30-day project enters observation list'
+assert_contains "$out" '| [x] | fortyfive | 45 天 | 2 |' '45-day clear project is prechecked for tier 2'
 assert_not_contains "$out" '| [x] | recent |' '29-day project is below threshold'
-assert_contains "$out" '| recent | 29 days | below stale threshold |' 'recent project remains in appendix'
-assert_contains "$out" '| openpr | 60 days | hard excluded | open PR - merge or close first |' 'open PR hard-excludes stale project'
-assert_contains "$out" '| [ ] | prfail | 60 days | 2 |' 'failed PR check prevents tier 2 precheck'
-assert_contains "$out" 'unknown (PR check failed)' 'failed PR check is reported as unknown'
-assert_contains "$out" '| inflight | 60 days | hard excluded |' 'in-flight project is hard excluded'
-assert_contains "$out" '| queued | 60 days | hard excluded | queued ship/docs work |' 'queued project is hard excluded'
-assert_contains "$out" '| decision | 60 days | hard excluded | open captain decision |' 'open decision is hard excluded'
-assert_contains "$out" '| [ ] | decisionunknown | 60 days | 2 |' 'unknown Beads decision status prevents a tier 2 precheck'
-assert_contains "$out" 'Beads decision status unknown' 'failed decision evidence is reported as unknown'
+assert_contains "$out" '| recent | 29 天 | 未达到闲置阈值 |' 'recent project remains in appendix'
+assert_contains "$out" '| openpr | 60 天 | 强制排除 | 存在开放的 PR，请先合并或关闭 |' 'open PR hard-excludes stale project'
+assert_contains "$out" '| [ ] | prfail | 60 天 | 2 |' 'failed PR check prevents tier 2 precheck'
+assert_contains "$out" 'PR 检查失败，状态未知' 'failed PR check is reported as unknown in Chinese'
+assert_contains "$out" '| inflight | 60 天 | 强制排除 |' 'in-flight project is hard excluded'
+assert_contains "$out" '| queued | 60 天 | 强制排除 | 任务清单中有排队的交付或文档工作 |' 'queued project is hard excluded'
+assert_contains "$out" '| decision | 60 天 | 强制排除 | 存在待船长决定的事项 |' 'open decision is hard excluded'
+assert_contains "$out" '| [ ] | decisionunknown | 60 天 | 2 |' 'unknown Beads decision status prevents a tier 2 precheck'
+assert_contains "$out" 'Beads 决策状态未知' 'failed decision evidence is reported as unknown in Chinese'
 assert_not_contains "$out" '| [x] | activity |' 'recent documentation activity prevents a stale precheck'
-assert_contains "$out" '| activity | 5 days | below stale threshold |' 'stale clock uses the youngest available activity age'
-assert_contains "$out" '| adcue | 90 days | hard excluded | static or configured whitelist |' 'static whitelist is hard excluded'
+assert_contains "$out" '| activity | 5 天 | 未达到闲置阈值 |' 'stale clock uses the youngest available activity age'
+assert_contains "$out" '| adcue | 90 天 | 强制排除 | 静态或配置白名单 |' 'static whitelist is hard excluded'
 pass 'Layer B applies 30/45 thresholds and hard exclusions'
 
 out=$(run_audit)
-assert_contains "$out" '| [ ] | fortyfive | 45 days | 2 |' 'local-only default does not precheck stale tier 2'
-assert_contains "$out" 'unknown (not checked)' 'local-only default reports PR evidence as unknown'
+assert_contains "$out" '| [ ] | fortyfive | 45 天 | 2 |' 'local-only default does not precheck stale tier 2'
+assert_contains "$out" '未检查 PR 状态' 'local-only default reports PR evidence as unknown in Chinese'
 report="$HOME_DIR/data/hygiene/custom.md"
 run_audit --output "$report" >/dev/null
 [ -f "$report" ] || fail '--output did not write the requested report'
-assert_grep '# Fleet hygiene audit -' "$report" 'written report is missing its title'
+assert_grep '# 舰队卫生审计 -' "$report" 'written report is missing its Chinese title'
+assert_grep '| 选择 | 池 | 槽位 | 路径 | 空闲时间 | 大小 | 分类 | 候选规则 |' "$report" 'written report is missing Chinese Layer A headers'
+assert_grep '## 如何回复' "$report" 'written report is missing Chinese reply instructions'
 pass 'audit is local-only by default and writes only an explicitly requested report'
 
 set +e
@@ -248,5 +262,11 @@ pass 'write failures return nonzero without reporting success'
 
 skill="$ROOT/.agents/skills/fleet-hygiene/SKILL.md"
 assert_grep "Add \`--check-prs\` only when the captain explicitly requests PR checks." "$skill" 'skill does not keep PR checks opt-in'
+assert_grep 'lavish-axi playbook input' "$skill" 'skill does not require current Lavish input guidance'
+assert_grep 'lavish-axi playbook table' "$skill" 'skill does not require current Lavish table guidance'
+assert_grep '.lavish/fleet-hygiene-YYYY-MM-DD.html' "$skill" 'skill does not define the dated Lavish artifact path'
+assert_grep 'native multi-select checkboxes' "$skill" 'skill does not require native multi-select controls'
+assert_grep 'window.lavish.queuePrompt()' "$skill" 'skill does not queue one concrete checklist prompt'
+assert_grep '船长，舰队卫生检查清单已在 Lavish 中打开' "$skill" 'skill chat summary is not explicitly Chinese'
 assert_not_contains "$(cat "$skill")" '## Safety boundary' 'skill restates policy outside the tracked docs owner'
-pass 'skill keeps policy ownership in docs and PR checks opt-in'
+pass 'skill keeps policy ownership in docs and requires Chinese Lavish presentation'

@@ -202,10 +202,29 @@ markdown_escape() {
 
 append_text() {
   if [ -n "$1" ]; then
-    printf '%s; %s' "$1" "$2"
+    printf '%s；%s' "$1" "$2"
   else
     printf '%s' "$2"
   fi
+}
+
+slot_class_label() {
+  case "$1" in
+    live) printf '使用中' ;;
+    dirty) printf '有未提交更改' ;;
+    unmerged) printf '有未合并提交' ;;
+    orphan) printf '孤立或无法读取' ;;
+    disposable) printf '可安全处置' ;;
+    *) printf '未知' ;;
+  esac
+}
+
+candidate_route_label() {
+  case "$1" in
+    Age) printf '按时间' ;;
+    Size) printf '按大小' ;;
+    *) printf '未知' ;;
+  esac
 }
 
 # Layer A records: pool, slot, path, class, age_seconds, age_days, size_kib.
@@ -257,7 +276,7 @@ cut -f1 "$A_ALL" | LC_ALL=C sort -u | while IFS= read -r pool; do
             "$p" "$s" "$path" "$class" "$age_seconds" "$age_days" "$size_kib" >> "$A_CANDIDATES"
           selected=$((selected + 1))
         else
-          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tretained by Size keep-2\n' \
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t因大小路径每池保留 2 个槽位\n' \
             "$p" "$s" "$path" "$class" "$age_seconds" "$age_days" "$size_kib" >> "$A_APPENDIX"
         fi
       done
@@ -266,18 +285,18 @@ done
 while IFS=$'\t' read -r pool slot path class age_seconds age_days size_kib; do
   [ -n "$pool" ] || continue
   case "$class" in
-    live) reason='live meta worktree' ;;
-    dirty) reason='dirty worktree' ;;
-    unmerged) reason='unmerged commits' ;;
-    orphan) reason='orphan or unreadable git metadata' ;;
+    live) reason='被运行中任务引用' ;;
+    dirty) reason='工作副本有未提交更改' ;;
+    unmerged) reason='存在未合并提交' ;;
+    orphan) reason='孤立槽位或无法读取 Git 元数据' ;;
     disposable)
       if [ "$age_seconds" -lt 604800 ] && [ "$size_kib" -lt 1048576 ]; then
-        reason='below Age and Size thresholds'
+        reason='未达到时间或大小阈值'
       else
         continue
       fi
       ;;
-    *) reason='unknown safety class' ;;
+    *) reason='安全分类未知' ;;
   esac
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$pool" "$slot" "$path" "$class" "$age_seconds" "$age_days" "$size_kib" "$reason" >> "$A_APPENDIX"
@@ -504,111 +523,122 @@ while IFS= read -r project; do
   reasons=
   warnings=
   if is_whitelisted "$project"; then
-    reasons='static or configured whitelist'
+    reasons='静态或配置白名单'
   fi
   if meta_project_active "$project"; then
-    reasons=$(append_text "$reasons" 'in-flight task or active second mate')
+    reasons=$(append_text "$reasons" '存在进行中的任务或活跃的二副')
   fi
   flags=$(backlog_flags "$project")
-  case ",$flags," in *,in_flight,*) reasons=$(append_text "$reasons" 'in-flight backlog work') ;; esac
-  case ",$flags," in *,queued,*) reasons=$(append_text "$reasons" 'queued ship/docs work') ;; esac
-  case ",$flags," in *,decision,*) reasons=$(append_text "$reasons" 'open captain decision') ;; esac
+  case ",$flags," in *,in_flight,*) reasons=$(append_text "$reasons" '任务清单中有进行中的工作') ;; esac
+  case ",$flags," in *,queued,*) reasons=$(append_text "$reasons" '任务清单中有排队的交付或文档工作') ;; esac
+  case ",$flags," in *,decision,*) reasons=$(append_text "$reasons" '存在待船长决定的事项') ;; esac
   beads_result=none
   if open_beads_decision "$repo"; then
     beads_result=open
-    reasons=$(append_text "$reasons" 'open Beads decision')
+    reasons=$(append_text "$reasons" '存在未解决的 Beads 决策')
   else
     beads_code=$?
-    [ "$beads_code" -ne 2 ] || warnings=$(append_text "$warnings" 'Beads decision status unknown')
+    [ "$beads_code" -ne 2 ] || warnings=$(append_text "$warnings" 'Beads 决策状态未知')
   fi
   safety=$(clone_safety "$repo")
   case "$safety" in
-    dirty|unpushed\ commits) reasons=$(append_text "$reasons" "$safety") ;;
-    unknown*) warnings=$(append_text "$warnings" "$safety") ;;
+    dirty) reasons=$(append_text "$reasons" '本地副本有未提交更改') ;;
+    unpushed\ commits) reasons=$(append_text "$reasons" '本地副本有未推送提交') ;;
+    'unknown (no local clone)') warnings=$(append_text "$warnings" '本地副本不存在，安全状态未知') ;;
+    'unknown (git unavailable)') warnings=$(append_text "$warnings" 'Git 不可用，本地副本安全状态未知') ;;
+    'unknown (not a git clone)') warnings=$(append_text "$warnings" '本地目录不是 Git 副本，安全状态未知') ;;
+    'unknown (branch comparison failed)') warnings=$(append_text "$warnings" '分支比较失败，本地副本安全状态未知') ;;
+    'unknown (no tracked branch)') warnings=$(append_text "$warnings" '没有跟踪分支，本地副本安全状态未知') ;;
+    unknown*) warnings=$(append_text "$warnings" '本地副本安全状态未知') ;;
   esac
   prs=$(pr_status "$repo")
   case "$prs" in
-    open) reasons=$(append_text "$reasons" 'open PR - merge or close first') ;;
-    unknown*) warnings=$(append_text "$warnings" "$prs") ;;
+    open) reasons=$(append_text "$reasons" '存在开放的 PR，请先合并或关闭') ;;
+    'unknown (not checked)') warnings=$(append_text "$warnings" '未检查 PR 状态') ;;
+    'unknown (gh-axi unavailable)') warnings=$(append_text "$warnings" 'gh-axi 不可用，PR 状态未知') ;;
+    'unknown (no GitHub origin)') warnings=$(append_text "$warnings" '没有 GitHub 来源，PR 状态未知') ;;
+    'unknown (PR check failed)') warnings=$(append_text "$warnings" 'PR 检查失败，状态未知') ;;
+    'unknown (unrecognized PR result)') warnings=$(append_text "$warnings" '无法识别 PR 检查结果，状态未知') ;;
+    unknown*) warnings=$(append_text "$warnings" 'PR 状态未知') ;;
   esac
 
   if [ -n "$reasons" ]; then
-    printf '%s\t%s\t%s\t%s\n' "$project" "$age_days" 'hard excluded' "$reasons${warnings:+; $warnings}" >> "$B_APPENDIX"
+    printf '%s\t%s\t%s\t%s\n' "$project" "$age_days" '强制排除' "$reasons${warnings:+；$warnings}" >> "$B_APPENDIX"
   elif [ "$age_days" -lt 30 ]; then
-    printf '%s\t%s\t%s\t%s\n' "$project" "$age_days" 'below stale threshold' "${warnings:-recent activity}" >> "$B_APPENDIX"
+    printf '%s\t%s\t%s\t%s\n' "$project" "$age_days" '未达到闲置阈值' "${warnings:-近期有活动}" >> "$B_APPENDIX"
   elif [ "$age_days" -ge 45 ] && [ -z "$warnings" ] && [ "$prs" = none ]; then
-    printf '%s\t%s\t[x]\t2\tstale at least 45 days; local abandonment prechecked\n' "$project" "$age_days" >> "$B_MAIN"
+    printf '%s\t%s\t[x]\t2\t已闲置至少 45 天；已预选本地放弃\n' "$project" "$age_days" >> "$B_MAIN"
   elif [ "$age_days" -ge 45 ]; then
-    printf '%s\t%s\t[ ]\t2\tstale at least 45 days; not prechecked: %s\n' "$project" "$age_days" "${warnings:-PR status unknown}" >> "$B_MAIN"
+    printf '%s\t%s\t[ ]\t2\t已闲置至少 45 天；未预选：%s\n' "$project" "$age_days" "${warnings:-PR 状态未知}" >> "$B_MAIN"
   else
-    printf '%s\t%s\t[ ]\tobserve\tstale 30-44 days\n' "$project" "$age_days" >> "$B_MAIN"
+    printf '%s\t%s\t[ ]\t观察\t已闲置 30 至 44 天\n' "$project" "$age_days" >> "$B_MAIN"
   fi
   : "$beads_result"
 done < "$PROJECTS"
 
 TODAY=$(format_day "$NOW")
 {
-  printf '# Fleet hygiene audit - %s\n\n' "$TODAY"
-  printf "This is a read-only checklist under \`docs/fleet-hygiene.md\`.\n"
-  printf 'No treehouse slot, project, task, decision, data file, local clone, or GitHub repository was changed.\n\n'
-  printf '## Layer A - safe treehouse candidates\n\n'
-  printf '| Select | Pool | Slot | Path | Age | Size | Class | Route |\n'
+  printf '# 舰队卫生审计 - %s\n\n' "$TODAY"
+  printf "这是依据 \`docs/fleet-hygiene.md\` 生成的只读检查清单。\n"
+  printf '本次审计未更改任何 treehouse 槽位、项目、任务、决策、数据文件、本地副本或 GitHub 仓库。\n\n'
+  printf '## A 层 - 可安全处置的 treehouse 候选项\n\n'
+  printf '| 选择 | 池 | 槽位 | 路径 | 空闲时间 | 大小 | 分类 | 候选规则 |\n'
   printf '|---|---|---|---|---:|---:|---|---|\n'
   if [ -s "$A_CANDIDATES" ]; then
     LC_ALL=C sort -t $'\t' -k8,8 -k5,5nr -k7,7nr -k3,3 "$A_CANDIDATES" \
       | while IFS=$'\t' read -r pool slot path class age_seconds age_days size_kib route; do
           : "$age_seconds"
-          printf "| [x] | %s | %s | \`%s\` | %s days | %s | %s | %s |\n" \
+          printf "| [x] | %s | %s | \`%s\` | %s 天 | %s | %s | %s |\n" \
             "$(markdown_escape "$pool")" "$(markdown_escape "$slot")" "$(markdown_escape "$path")" \
-            "$age_days" "$(format_size "$size_kib")" "$class" "$route"
+            "$age_days" "$(format_size "$size_kib")" "$(slot_class_label "$class")" "$(candidate_route_label "$route")"
         done
   else
-    printf '|  |  |  | No safe candidates |  |  |  |  |\n'
+    printf '|  |  |  | 没有可安全处置的候选项 |  |  |  |  |\n'
   fi
-  printf '\n## Layer B - stale project candidates\n\n'
-  printf '| Select | Project | Stale clock | Suggested tier | Reason |\n'
+  printf '\n## B 层 - 闲置项目候选项\n\n'
+  printf '| 选择 | 项目 | 闲置时间 | 建议级别 | 原因 |\n'
   printf '|---|---|---:|---:|---|\n'
   if [ -s "$B_MAIN" ]; then
     LC_ALL=C sort -t $'\t' -k2,2nr -k1,1 "$B_MAIN" \
       | while IFS=$'\t' read -r project age_days select tier reason; do
-          printf '| %s | %s | %s days | %s | %s |\n' \
+          printf '| %s | %s | %s 天 | %s | %s |\n' \
             "$select" "$(markdown_escape "$project")" "$age_days" "$tier" "$(markdown_escape "$reason")"
         done
   else
-    printf '|  | No stale projects passed the hard exclusions |  |  |  |\n'
+    printf '|  | 没有通过强制排除检查的闲置项目 |  |  |  |\n'
   fi
-  printf '\nTier 2 means abandon locally while retaining the local clone and GitHub remote.\n'
-  printf 'The audit does not execute tier 1, 2, or 3 actions.\n\n'
-  printf '## Appendix - excluded, retained, and below-threshold items\n\n'
-  printf '### Layer A\n\n'
-  printf '| Pool | Slot | Path | Age | Size | Class | Reason |\n'
+  printf '\n级别 2 表示在保留本地副本和 GitHub 远端仓库的前提下，在本地放弃该项目。\n'
+  printf '本次审计不会执行级别 1、2 或 3 的任何操作。\n\n'
+  printf '## 附录 - 已排除、已保留和未达到阈值的项目\n\n'
+  printf '### A 层\n\n'
+  printf '| 池 | 槽位 | 路径 | 空闲时间 | 大小 | 分类 | 原因 |\n'
   printf '|---|---|---|---:|---:|---|---|\n'
   if [ -s "$A_APPENDIX" ]; then
     LC_ALL=C sort -t $'\t' -k1,1 -k5,5nr -k3,3 "$A_APPENDIX" \
       | while IFS=$'\t' read -r pool slot path class age_seconds age_days size_kib reason; do
           : "$age_seconds"
-          printf "| %s | %s | \`%s\` | %s days | %s | %s | %s |\n" \
+          printf "| %s | %s | \`%s\` | %s 天 | %s | %s | %s |\n" \
             "$(markdown_escape "$pool")" "$(markdown_escape "$slot")" "$(markdown_escape "$path")" \
-            "$age_days" "$(format_size "$size_kib")" "$class" "$(markdown_escape "$reason")"
+            "$age_days" "$(format_size "$size_kib")" "$(slot_class_label "$class")" "$(markdown_escape "$reason")"
         done
   else
-    printf '|  |  | No excluded or retained slots |  |  |  |  |\n'
+    printf '|  |  | 没有已排除或因配额保留的槽位 |  |  |  |  |\n'
   fi
-  printf '\n### Layer B\n\n'
-  printf '| Project | Stale clock | Disposition | Reason |\n'
+  printf '\n### B 层\n\n'
+  printf '| 项目 | 闲置时间 | 处理结论 | 原因 |\n'
   printf '|---|---:|---|---|\n'
   if [ -s "$B_APPENDIX" ]; then
     LC_ALL=C sort -t $'\t' -k2,2nr -k1,1 "$B_APPENDIX" \
       | while IFS=$'\t' read -r project age_days disposition reason; do
-          printf '| %s | %s days | %s | %s |\n' \
+          printf '| %s | %s 天 | %s | %s |\n' \
             "$(markdown_escape "$project")" "$age_days" "$(markdown_escape "$disposition")" "$(markdown_escape "$reason")"
         done
   else
-    printf '|  |  | No excluded or below-threshold projects |  |\n'
+    printf '|  |  | 没有已排除或未达到阈值的项目 |  |\n'
   fi
-  printf '\n## How to reply\n\n'
-  printf 'Reply with the Layer A pool/slot rows and Layer B project/tier rows you want to act on.\n'
-  printf 'Cleanup is a separate instruction and requires a fresh safety check before any change.\n'
+  printf '\n## 如何回复\n\n'
+  printf '请选择希望后续处理的 A 层池/槽位行和 B 层项目/级别行。\n'
+  printf '清理属于后续独立指令；进行任何更改前都必须重新执行安全检查。\n'
 } > "$REPORT"
 
 cat "$REPORT"

@@ -68,6 +68,7 @@ Ambiguously owned data is listed for review and is never moved automatically.
 
 ## P0 report and confirmation boundary
 
+Captain-facing P0 presentation is delivered in Chinese through an interactive Lavish checklist, with the dated Markdown report retained as its source artifact.
 The P0 report contains a prechecked Layer A table, a Layer B table, appendices for every exclusion or caution the scanner can establish, and a reply format.
 A captain reply identifies desired Layer A pool/slot rows and Layer B project/tier rows.
 That reply does not alter P0's zero-delete behavior, and implementation of any selected action belongs to a later phase with fresh safety checks and explicit authority.
