@@ -27,7 +27,8 @@
 #
 # Output is Markdown on stdout. --write also saves it to
 # $FM_HOME/data/hygiene/report-YYYY-MM-DD.md. --output PATH implies --write and
-# selects a different path. The command is always dry-run only.
+# selects another Markdown file directly inside that report directory. The
+# command is always dry-run only.
 set -u
 
 usage() {
@@ -40,7 +41,7 @@ prunes, archives, closes, or removes anything.
 
 Options:
   --write          Also write $FM_HOME/data/hygiene/report-YYYY-MM-DD.md
-  --output PATH    Also write PATH instead of the default report path
+  --output PATH    Write another .md file directly in $FM_HOME/data/hygiene
   --check-prs      Query open PRs with gh-axi for GitHub-backed project clones
   -h, --help       Show this help
 
@@ -653,10 +654,19 @@ TODAY=$(format_day "$NOW")
 
 cat "$REPORT"
 if [ "$WRITE" -eq 1 ]; then
+  REPORT_DIR="$FM_HOME/data/hygiene"
   if [ -z "$OUTPUT" ]; then
-    OUTPUT="$FM_HOME/data/hygiene/report-$TODAY.md"
+    OUTPUT="$REPORT_DIR/report-$TODAY.md"
   fi
-  if ! mkdir -p "$(dirname "$OUTPUT")"; then
+  if [ "$(dirname "$OUTPUT")" != "$REPORT_DIR" ] || [ "${OUTPUT##*.}" != md ]; then
+    printf 'fm-fleet-hygiene-audit: output must be a .md file directly inside %s\n' "$REPORT_DIR" >&2
+    exit 1
+  fi
+  if [ -L "$FM_HOME/data" ] || [ -L "$REPORT_DIR" ] || [ -L "$OUTPUT" ]; then
+    printf 'fm-fleet-hygiene-audit: refusing symbolic-link output path: %s\n' "$OUTPUT" >&2
+    exit 1
+  fi
+  if ! mkdir -p "$REPORT_DIR"; then
     printf 'fm-fleet-hygiene-audit: could not create output directory for %s\n' "$OUTPUT" >&2
     exit 1
   fi

@@ -299,11 +299,27 @@ assert_grep '## 如何回复' "$report" 'written report is missing Chinese reply
 pass 'audit is local-only by default and writes only an explicitly requested report'
 
 set +e
-out=$(run_audit --output "$HOME_DIR/data/projects.md/report.md" 2>&1)
+printf 'registry sentinel\n' > "$HOME_DIR/data/projects.md"
+out=$(run_audit --output "$HOME_DIR/data/projects.md" 2>&1)
 rc=$?
-[ "$rc" -ne 0 ] || fail 'output directory creation failure returned success'
-assert_contains "$out" 'could not create output directory' 'directory creation failure is not reported'
-assert_not_contains "$out" 'fm-fleet-hygiene-audit: wrote' 'directory creation failure reported a successful write'
+[ "$rc" -ne 0 ] || fail 'registry output path returned success'
+assert_contains "$out" 'output must be a .md file directly inside' 'registry output path is not rejected'
+[ "$(cat "$HOME_DIR/data/projects.md")" = 'registry sentinel' ] || fail 'registry output path modified the registry'
+
+printf 'registry target sentinel\n' > "$HOME_DIR/data/registry-target.md"
+ln -s "$HOME_DIR/data/registry-target.md" "$HOME_DIR/data/hygiene/report-link.md"
+out=$(run_audit --output "$HOME_DIR/data/hygiene/report-link.md" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] || fail 'symbolic-link output path returned success'
+assert_contains "$out" 'refusing symbolic-link output path' 'symbolic-link output path is not rejected'
+[ "$(cat "$HOME_DIR/data/registry-target.md")" = 'registry target sentinel' ] \
+  || fail 'symbolic-link output modified its target'
+
+out=$(run_audit --output "$HOME_DIR/data/hygiene/report.txt" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] || fail 'non-Markdown output path returned success'
+assert_contains "$out" 'output must be a .md file directly inside' 'non-Markdown output path is not rejected'
+pass 'output is confined to nonsymlink Markdown reports'
 
 cat > "$FAKEBIN/cp" <<'SH'
 #!/usr/bin/env bash
