@@ -122,12 +122,13 @@ physical_path() {
 }
 
 latest_mtime() {
-  local root=$1 latest current entry
-  latest=$(stat_mtime "$root" || printf '0')
+  local root=$1 latest current entry entries="$TMP/latest-mtime"
+  latest=$(stat_mtime "$root") || return 1
+  find "$root" -mindepth 1 -maxdepth 3 -print > "$entries" 2>/dev/null || return 1
   while IFS= read -r entry; do
-    current=$(stat_mtime "$entry" || printf '0')
+    current=$(stat_mtime "$entry") || return 1
     [ "$current" -le "$latest" ] || latest=$current
-  done < <(find "$root" -mindepth 1 -maxdepth 3 -print 2>/dev/null)
+  done < "$entries"
   printf '%s\n' "$latest"
 }
 
@@ -163,17 +164,21 @@ slot_git_root() {
 }
 
 slot_class() {
-  local slot=$1 repo upstream branch
+  local slot=$1 repo upstream branch unmerged status
   if live_worktree "$slot"; then
     printf 'live\n'
     return
   fi
   repo=$(slot_git_root "$slot") || { printf 'orphan\n'; return; }
-  if [ -n "$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+  unmerged=$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null) \
+    || { printf 'orphan\n'; return; }
+  if [ -n "$unmerged" ]; then
     printf 'unmerged\n'
     return
   fi
-  if [ -n "$(git -C "$repo" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+  status=$(git -C "$repo" status --porcelain --untracked-files=normal 2>/dev/null) \
+    || { printf 'orphan\n'; return; }
+  if [ -n "$status" ]; then
     printf 'dirty\n'
     return
   fi
@@ -235,14 +240,16 @@ if [ -d "$TREEHOUSE_ROOT" ]; then
       [ -d "$slot_dir" ] || continue
       pool=$(basename "$pool_dir")
       slot=$(basename "$slot_dir")
-      mtime=$(latest_mtime "$slot_dir")
-      case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+      mtime_known=1
+      mtime=$(latest_mtime "$slot_dir") || { mtime=$NOW; mtime_known=0; }
+      case "$mtime" in ''|*[!0-9]*) mtime=$NOW; mtime_known=0 ;; esac
       age_seconds=$((NOW - mtime))
       [ "$age_seconds" -ge 0 ] || age_seconds=0
       age_days=$((age_seconds / 86400))
       size_kib=$(du -sk "$slot_dir" 2>/dev/null | awk 'NR==1 {print $1}')
       case "$size_kib" in ''|*[!0-9]*) size_kib=0 ;; esac
       class=$(slot_class "$slot_dir")
+      [ "$mtime_known" -eq 1 ] || class=orphan
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$pool" "$slot" "$(physical_path "$slot_dir")" "$class" \
         "$age_seconds" "$age_days" "$size_kib" >> "$A_ALL"
@@ -440,12 +447,14 @@ pr_status() {
 }
 
 clone_safety() {
-  local repo=$1 upstream ahead branch
+  local repo=$1 upstream ahead branch status
   [ -d "$repo" ] || { printf 'unknown (no local clone)\n'; return; }
   command -v git >/dev/null 2>&1 || { printf 'unknown (git unavailable)\n'; return; }
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || { printf 'unknown (not a git clone)\n'; return; }
-  if [ -n "$(git -C "$repo" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+  status=$(git -C "$repo" status --porcelain --untracked-files=normal 2>/dev/null) \
+    || { printf 'unknown (git status failed)\n'; return; }
+  if [ -n "$status" ]; then
     printf 'dirty\n'
     return
   fi
@@ -547,6 +556,7 @@ while IFS= read -r project; do
     'unknown (no local clone)') warnings=$(append_text "$warnings" '本地副本不存在，安全状态未知') ;;
     'unknown (git unavailable)') warnings=$(append_text "$warnings" 'Git 不可用，本地副本安全状态未知') ;;
     'unknown (not a git clone)') warnings=$(append_text "$warnings" '本地目录不是 Git 副本，安全状态未知') ;;
+    'unknown (git status failed)') warnings=$(append_text "$warnings" 'Git 状态检查失败，本地副本安全状态未知') ;;
     'unknown (branch comparison failed)') warnings=$(append_text "$warnings" '分支比较失败，本地副本安全状态未知') ;;
     'unknown (no tracked branch)') warnings=$(append_text "$warnings" '没有跟踪分支，本地副本安全状态未知') ;;
     unknown*) warnings=$(append_text "$warnings" '本地副本安全状态未知') ;;

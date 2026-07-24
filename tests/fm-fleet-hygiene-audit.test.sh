@@ -106,6 +106,57 @@ assert_not_contains "$out" '| [x] | pool-protected | no-upstream |' 'a default b
 assert_contains "$out" '| 有未合并提交 | 存在未合并提交 |' 'uncertain no-upstream work remains visible in the Chinese appendix'
 pass 'Layer A applies Age/Size OR, Size keep-two, and live metadata exclusion'
 
+REAL_GIT=$(command -v git)
+FAIL_GIT="$TMP_ROOT/fail-git"
+mkdir -p "$FAIL_GIT"
+cat > "$FAIL_GIT/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" diff --name-only --diff-filter=U "*|*" status --porcelain --untracked-files=normal "*) exit 1 ;;
+esac
+exec "$REAL_GIT" "$@"
+SH
+chmod +x "$FAIL_GIT/git"
+out=$(REAL_GIT="$REAL_GIT" PATH="$FAIL_GIT:$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" \
+  FM_TREEHOUSE_ROOT="$TREEHOUSE" FM_HYGIENE_NOW_EPOCH="$NOW" \
+  "$ROOT/bin/fm-fleet-hygiene-audit.sh")
+assert_not_contains "$out" '| [x] | pool-a | age-small |' 'failed Git evidence preselected a Layer A slot'
+assert_contains "$out" '| pool-a | age-small |' 'slot with failed Git evidence is missing from the appendix'
+assert_contains "$out" '| 孤立或无法读取 |' 'failed Git evidence is not classified as unreadable'
+
+FAIL_MTIME="$TMP_ROOT/fail-mtime"
+mkdir -p "$FAIL_MTIME"
+cat > "$FAIL_MTIME/stat" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$FAIL_MTIME/stat"
+out=$(PATH="$FAIL_MTIME:$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_TREEHOUSE_ROOT="$TREEHOUSE" \
+  FM_HYGIENE_NOW_EPOCH="$NOW" "$ROOT/bin/fm-fleet-hygiene-audit.sh")
+assert_not_contains "$out" '| [x] | pool-a | age-small |' 'failed mtime evidence preselected a Layer A slot'
+assert_contains "$out" '| pool-a | age-small |' 'slot with failed mtime evidence is missing from the appendix'
+assert_contains "$out" '| 孤立或无法读取 |' 'failed mtime evidence is not classified as unreadable'
+
+cat > "$FAIL_MTIME/stat" <<SH
+#!/usr/bin/env bash
+exec "$(command -v stat)" "\$@"
+SH
+cat > "$FAIL_MTIME/find" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" -mindepth 1 -maxdepth 3 -print "*) exit 1 ;;
+esac
+exec "$REAL_FIND" "$@"
+SH
+chmod +x "$FAIL_MTIME/find"
+REAL_FIND=$(command -v find)
+out=$(REAL_FIND="$REAL_FIND" PATH="$FAIL_MTIME:$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" \
+  FM_TREEHOUSE_ROOT="$TREEHOUSE" FM_HYGIENE_NOW_EPOCH="$NOW" \
+  "$ROOT/bin/fm-fleet-hygiene-audit.sh")
+assert_not_contains "$out" '| [x] | pool-a | age-small |' 'failed mtime traversal preselected a Layer A slot'
+assert_contains "$out" '| 孤立或无法读取 |' 'failed mtime traversal is not classified as unreadable'
+pass 'Layer A fails closed when Git or mtime evidence cannot be read'
+
 EMPTY_HOME="$TMP_ROOT/empty-home"
 EMPTY_TREEHOUSE="$TMP_ROOT/empty-treehouse"
 mkdir -p "$EMPTY_HOME/state" "$EMPTY_HOME/data" "$EMPTY_HOME/projects" "$EMPTY_TREEHOUSE"
@@ -228,6 +279,13 @@ assert_not_contains "$out" '| [x] | activity |' 'recent documentation activity p
 assert_contains "$out" '| activity | 5 天 | 未达到闲置阈值 |' 'stale clock uses the youngest available activity age'
 assert_contains "$out" '| adcue | 90 天 | 强制排除 | 静态或配置白名单 |' 'static whitelist is hard excluded'
 pass 'Layer B applies 30/45 thresholds and hard exclusions'
+
+out=$(REAL_GIT="$REAL_GIT" PATH="$FAIL_GIT:$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" \
+  FM_TREEHOUSE_ROOT="$TREEHOUSE" FM_HYGIENE_NOW_EPOCH="$NOW" \
+  "$ROOT/bin/fm-fleet-hygiene-audit.sh" --check-prs)
+assert_contains "$out" '| [ ] | fortyfive | 45 天 | 2 |' 'failed Git status preselected a Layer B project'
+assert_contains "$out" 'Git 状态检查失败，本地副本安全状态未知' 'failed Git status is not reported as unknown'
+pass 'Layer B fails closed when Git status cannot be read'
 
 out=$(run_audit)
 assert_contains "$out" '| [ ] | fortyfive | 45 天 | 2 |' 'local-only default does not precheck stale tier 2'
