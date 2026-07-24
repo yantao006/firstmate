@@ -186,3 +186,23 @@ run_audit --output "$report" >/dev/null
 [ -f "$report" ] || fail '--output did not write the requested report'
 assert_grep '# Fleet hygiene audit -' "$report" 'written report is missing its title'
 pass 'audit is local-only by default and writes only an explicitly requested report'
+
+set +e
+out=$(run_audit --output "$HOME_DIR/data/projects.md/report.md" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] || fail 'output directory creation failure returned success'
+assert_contains "$out" 'could not create output directory' 'directory creation failure is not reported'
+assert_not_contains "$out" 'fm-fleet-hygiene-audit: wrote' 'directory creation failure reported a successful write'
+
+cat > "$FAKEBIN/cp" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$FAKEBIN/cp"
+set +e
+out=$(run_audit --output "$HOME_DIR/data/hygiene/copy-failure.md" 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] || fail 'report copy failure returned success'
+assert_contains "$out" 'could not write' 'report copy failure is not reported'
+assert_not_contains "$out" 'fm-fleet-hygiene-audit: wrote' 'report copy failure reported a successful write'
+pass 'write failures return nonzero without reporting success'

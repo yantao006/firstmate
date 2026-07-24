@@ -608,7 +608,13 @@ if [ "$WRITE" -eq 1 ]; then
   if [ -z "$OUTPUT" ]; then
     OUTPUT="$FM_HOME/data/hygiene/report-$TODAY.md"
   fi
-  mkdir -p "$(dirname "$OUTPUT")"
-  cp "$REPORT" "$OUTPUT"
+  if ! mkdir -p "$(dirname "$OUTPUT")"; then
+    printf 'fm-fleet-hygiene-audit: could not create output directory for %s\n' "$OUTPUT" >&2
+    exit 1
+  fi
+  if ! cp "$REPORT" "$OUTPUT"; then
+    printf 'fm-fleet-hygiene-audit: could not write %s\n' "$OUTPUT" >&2
+    exit 1
+  fi
   printf 'fm-fleet-hygiene-audit: wrote %s\n' "$OUTPUT" >&2
 fi
