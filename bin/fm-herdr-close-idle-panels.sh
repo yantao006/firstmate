@@ -402,7 +402,7 @@ echo
 if [[ "$CLOSED_COUNT" -gt 0 ]]; then
   echo "idle ($CLOSED_COUNT):"
   for row in "${closed[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  \(.pane_id)  [\(.action)]  tab=\(.tab_id)  cwd=\(if .cwd == "" then "?" else .cwd end)"'
+    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  action=\(.action | tojson)  tab=\(.tab_id | tojson)  cwd=\((if .cwd == "" then "?" else .cwd end) | tojson)"'
   done
   echo
 else
@@ -413,7 +413,7 @@ fi
 if [[ "$KEPT_COUNT" -gt 0 ]]; then
   echo "kept ($KEPT_COUNT):"
   for row in "${kept[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  \(.pane_id)  \(.reason)  tab=\(.tab_id)"'
+    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  reason=\(.reason | tojson)  tab=\(.tab_id | tojson)"'
   done
   echo
 fi
@@ -421,7 +421,7 @@ fi
 if [[ "$ABORTED_COUNT" -gt 0 ]]; then
   echo "aborted ($ABORTED_COUNT):"
   for row in "${aborted[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  \(.pane_id)  \(.reason)  tab=\(.tab_id)"'
+    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  reason=\(.reason | tojson)  tab=\(.tab_id | tojson)"'
   done
   echo
 fi
@@ -429,7 +429,7 @@ fi
 if [[ "$ERROR_COUNT" -gt 0 ]]; then
   echo "errors ($ERROR_COUNT):" >&2
   for row in "${errors[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  \(.pane_id)  \(.error)"' >&2
+    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  error=\(.error | tojson)"' >&2
   done
   exit 1
 fi

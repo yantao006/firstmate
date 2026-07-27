@@ -255,7 +255,7 @@ Its before/after tripwire requires the live default-session snapshot to remain b
 The helper's header and `--help` own exact commands.
 Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never duplicate the destructive policy.
 
-Operator-side idle pane cleanup is `bin/fm-herdr-close-idle-panels.sh`; only focus protection is optional, while agent, harness, and editor protections are mandatory, and its header and `--help` own flags.
+Operator-side idle pane cleanup is `bin/fm-herdr-close-idle-panels.sh`; its header and `--help` own behavior and flags.
 
 ## Active limits
 

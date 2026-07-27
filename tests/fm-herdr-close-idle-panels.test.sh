@@ -417,8 +417,21 @@ write_process p-empty-cwd "$(fg_shell p-empty-cwd)"
 code=0
 out=$("$SCRIPT" --dry-run 2>&1) || code=$?
 expect_code 0 "$code" "human empty-cwd exit"
-assert_contains "$out" "p-empty-cwd  [dry-run]  tab=t-empty  cwd=?" "human empty-cwd fields"
+assert_contains "$out" 'pane_id="p-empty-cwd"  action="dry-run"  tab="t-empty"  cwd="?"' "human empty-cwd fields"
 pass "human summary preserves empty cwd fields"
+
+# --- human summary escapes control characters -------------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-control","tab_id":"t-control","cwd":"/tmp/line\n\u001b[31mred"}]}}
+JSON
+write_process p-control "$(fg_shell p-control)"
+code=0
+out=$("$SCRIPT" --dry-run 2>&1) || code=$?
+expect_code 0 "$code" "human control-character exit"
+assert_contains "$out" 'cwd="/tmp/line\n\u001b[31mred"' "human control characters escaped"
+assert_not_contains "$out" $'\033' "human output contains no raw escape"
+pass "human summary escapes control characters"
 
 # --- malformed pane list is rejected ----------------------------------------
 
