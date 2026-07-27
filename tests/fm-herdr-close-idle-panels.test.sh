@@ -408,6 +408,18 @@ rm "$STATE/focus-steal-p-restore-fail"
 printf '%s\n' p-captain > "$STATE/focused-pane"
 pass "focus restoration failure stops further closes"
 
+# --- human summary preserves empty cwd --------------------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-empty-cwd","tab_id":"t-empty","cwd":""}]}}
+JSON
+write_process p-empty-cwd "$(fg_shell p-empty-cwd)"
+code=0
+out=$("$SCRIPT" --dry-run 2>&1) || code=$?
+expect_code 0 "$code" "human empty-cwd exit"
+assert_contains "$out" "p-empty-cwd  [dry-run]  tab=t-empty  cwd=?" "human empty-cwd fields"
+pass "human summary preserves empty cwd fields"
+
 # --- malformed pane list is rejected ----------------------------------------
 
 printf '%s\n' '{"result":{"panes":{}}}' > "$STATE/pane-list.json"

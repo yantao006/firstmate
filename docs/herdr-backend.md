@@ -252,10 +252,10 @@ It provisions only non-default names beginning with `fm-lab-`, appends an explic
 Immediately before every destructive call it re-queries the named session and refuses empty, missing, literal `default`, or `default:true` identities.
 Its before/after tripwire requires the live default-session snapshot to remain byte-identical.
 
-Operator-side idle pane cleanup is `bin/fm-herdr-close-idle-panels.sh`; only focus protection is optional, while agent, harness, and editor protections are mandatory, and its header and `--help` own flags.
-
 The helper's header and `--help` own exact commands.
 Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never duplicate the destructive policy.
+
+Operator-side idle pane cleanup is `bin/fm-herdr-close-idle-panels.sh`; only focus protection is optional, while agent, harness, and editor protections are mandatory, and its header and `--help` own flags.
 
 ## Active limits
 

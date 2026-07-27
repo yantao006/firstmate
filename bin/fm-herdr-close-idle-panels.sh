@@ -402,8 +402,7 @@ echo
 if [[ "$CLOSED_COUNT" -gt 0 ]]; then
   echo "idle ($CLOSED_COUNT):"
   for row in "${closed[@]:-}"; do
-    IFS=$'\t' read -r id action cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.action,.cwd,.tab_id]|@tsv')
-    echo "  $id  [$action]  tab=$tab  cwd=${cwd:-?}"
+    printf '%s' "$row" | jq -r '"  \(.pane_id)  [\(.action)]  tab=\(.tab_id)  cwd=\(if .cwd == "" then "?" else .cwd end)"'
   done
   echo
 else
@@ -414,8 +413,7 @@ fi
 if [[ "$KEPT_COUNT" -gt 0 ]]; then
   echo "kept ($KEPT_COUNT):"
   for row in "${kept[@]:-}"; do
-    IFS=$'\t' read -r id reason cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.reason,.cwd,.tab_id]|@tsv')
-    echo "  $id  $reason  tab=$tab"
+    printf '%s' "$row" | jq -r '"  \(.pane_id)  \(.reason)  tab=\(.tab_id)"'
   done
   echo
 fi
@@ -423,8 +421,7 @@ fi
 if [[ "$ABORTED_COUNT" -gt 0 ]]; then
   echo "aborted ($ABORTED_COUNT):"
   for row in "${aborted[@]:-}"; do
-    IFS=$'\t' read -r id reason cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.reason,.cwd,.tab_id]|@tsv')
-    echo "  $id  $reason  tab=$tab"
+    printf '%s' "$row" | jq -r '"  \(.pane_id)  \(.reason)  tab=\(.tab_id)"'
   done
   echo
 fi
@@ -432,8 +429,7 @@ fi
 if [[ "$ERROR_COUNT" -gt 0 ]]; then
   echo "errors ($ERROR_COUNT):" >&2
   for row in "${errors[@]:-}"; do
-    IFS=$'\t' read -r id err cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.error,.cwd,.tab_id]|@tsv')
-    echo "  $id  $err" >&2
+    printf '%s' "$row" | jq -r '"  \(.pane_id)  \(.error)"' >&2
   done
   exit 1
 fi
