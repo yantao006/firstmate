@@ -128,7 +128,10 @@ list_json=$(herdr_cli pane list 2>/dev/null) || {
   exit 1
 }
 
-mapfile -t PANE_IDS < <(printf '%s' "$list_json" | jq -r '.result.panes[]?.pane_id // empty')
+PANE_IDS=()
+while IFS= read -r pane_id; do
+  [[ -n "$pane_id" ]] && PANE_IDS+=("$pane_id")
+done < <(printf '%s' "$list_json" | jq -r '.result.panes[]?.pane_id // empty')
 
 closed=()
 kept=()
@@ -156,6 +159,15 @@ for pane_id in "${PANE_IDS[@]}"; do
       kept+=("$pane_id|$reason|$cwd|$tab_id")
       continue
     }
+    if ! printf '%s' "$pinfo" | jq -e --arg pane "$pane_id" '
+      .result.type == "pane_process_info"
+      and .result.process_info.pane_id == $pane
+      and (.result.process_info.foreground_processes | type) == "array"
+    ' >/dev/null 2>&1; then
+      reason="invalid process-info response"
+      kept+=("$pane_id|$reason|$cwd|$tab_id")
+      continue
+    fi
     # Inspect each foreground process
     while IFS=$'\t' read -r name cmdline argv0; do
       [[ -z "${name:-}" && -z "${cmdline:-}" && -z "${argv0:-}" ]] && continue
@@ -221,6 +233,9 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
     --argjson errors "$(printf '%s\n' "${errors[@]:-}" | jq -R -s -c 'split("\n")|map(select(length>0)|split("|")|{pane_id:.[0],error:.[1],cwd:.[2],tab_id:.[3]})')" \
     '{session:$session, dry_run:($dry==1), closed:$closed, kept:$kept, errors:$errors,
       counts:{closed:($closed|length), kept:($kept|length), errors:($errors|length)}}'
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    exit 1
+  fi
   exit 0
 fi
 

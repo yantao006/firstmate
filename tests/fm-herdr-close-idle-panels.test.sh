@@ -62,6 +62,7 @@ case "$cmd $sub" in
   "pane close")
     pane=${args[2]:-}
     [ -n "$pane" ] || { echo "fake herdr: missing pane id" >&2; exit 2; }
+    [ ! -f "$state/close-fail-$pane" ] || exit 1
     printf '%s\n' "$pane" >> "${FM_FAKE_CLOSE_LOG:?}"
     printf '{"result":{"closed":true}}\n'
     exit 0
@@ -88,13 +89,15 @@ write_process() {
 }
 
 fg_shell() {
-  printf '%s\n' '{"result":{"process_info":{"foreground_processes":[{"name":"zsh","cmdline":"-zsh","argv0":"-zsh"}]}}}'
+  local pane_id=$1
+  jq -nc --arg pane "$pane_id" \
+    '{result:{type:"pane_process_info",process_info:{pane_id:$pane,foreground_processes:[{name:"zsh",cmdline:"-zsh",argv0:"-zsh"}]}}}'
 }
 
 fg_named() {
-  local name=$1 cmdline=$2 argv0=$3
-  jq -nc --arg n "$name" --arg c "$cmdline" --arg a "$argv0" \
-    '{result:{process_info:{foreground_processes:[{name:$n,cmdline:$c,argv0:$a}]}}}'
+  local pane_id=$1 name=$2 cmdline=$3 argv0=$4
+  jq -nc --arg pane "$pane_id" --arg n "$name" --arg c "$cmdline" --arg a "$argv0" \
+    '{result:{type:"pane_process_info",process_info:{pane_id:$pane,foreground_processes:[{name:$n,cmdline:$c,argv0:$a}]}}}'
 }
 
 # --- arg parsing / help -----------------------------------------------------
@@ -155,12 +158,12 @@ write_pane_list <<'JSON'
   }
 }
 JSON
-write_process p-idle "$(fg_shell)"
-write_process p-focused "$(fg_shell)"
-write_process p-agent "$(fg_shell)"
-write_process p-editor "$(fg_named nvim nvim /usr/bin/nvim)"
-write_process p-harness "$(fg_named claude 'claude --dangerously-skip-permissions' /opt/homebrew/bin/claude)"
-write_process p-nonshell "$(fg_named node 'node app.js' /usr/local/bin/node)"
+write_process p-idle "$(fg_shell p-idle)"
+write_process p-focused "$(fg_shell p-focused)"
+write_process p-agent "$(fg_shell p-agent)"
+write_process p-editor "$(fg_named p-editor nvim nvim /usr/bin/nvim)"
+write_process p-harness "$(fg_named p-harness claude 'claude --dangerously-skip-permissions' /opt/homebrew/bin/claude)"
+write_process p-nonshell "$(fg_named p-nonshell node 'node app.js' /usr/local/bin/node)"
 
 : > "$CLOSE_LOG"
 code=0
@@ -207,8 +210,8 @@ write_pane_list <<'JSON'
   }
 }
 JSON
-write_process p-a "$(fg_shell)"
-write_process p-b "$(fg_shell)"
+write_process p-a "$(fg_shell p-a)"
+write_process p-b "$(fg_shell p-b)"
 : > "$CLOSE_LOG"
 code=0
 out=$("$SCRIPT" --json 2>&1) || code=$?
@@ -219,6 +222,35 @@ echo "$out" | jq -e '.kept[0].pane_id == "p-b"' >/dev/null || fail "agent kept o
 closes=$(cat "$CLOSE_LOG")
 [ "$closes" = "p-a" ] || fail "close log expected only p-a, got: $closes"
 pass "live close closes only idle panes"
+
+# --- malformed process-info fails closed ------------------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-malformed","tab_id":"t1","cwd":"/tmp/malformed","focused":false,"agent":""}]}}
+JSON
+write_process p-malformed '{"result":{"type":"pane_process_info","process_info":{"pane_id":"p-other","foreground_processes":[]}}}'
+: > "$CLOSE_LOG"
+code=0
+out=$("$SCRIPT" --dry-run --json 2>&1) || code=$?
+expect_code 0 "$code" "malformed process-info dry-run exit"
+echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-malformed" and (.kept[0].reason | test("invalid process-info"))' >/dev/null \
+  || fail "malformed process-info must be kept: $out"
+pass "malformed process-info fails closed"
+
+# --- JSON reports close failures with nonzero status ------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-fail","tab_id":"t1","cwd":"/tmp/fail","focused":false,"agent":""}]}}
+JSON
+write_process p-fail "$(fg_shell p-fail)"
+: > "$STATE/close-fail-p-fail"
+code=0
+out=$("$SCRIPT" --json 2>&1) || code=$?
+expect_code 1 "$code" "JSON close failure exit"
+echo "$out" | jq -e '.counts.errors == 1 and .errors[0].pane_id == "p-fail"' >/dev/null \
+  || fail "JSON close failure summary: $out"
+rm "$STATE/close-fail-p-fail"
+pass "JSON close failures return nonzero"
 
 # --- --session is forwarded -------------------------------------------------
 
