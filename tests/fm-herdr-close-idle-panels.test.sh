@@ -23,6 +23,7 @@ cat > "$FAKEBIN/herdr" <<'SH'
 #!/usr/bin/env bash
 set -eu
 state=${FM_FAKE_HERDR_STATE:?}
+printf '%s\n' "$*" >> "$state/calls.log"
 # Drop trailing --session <name> if present (script may pass it).
 args=("$@")
 if [ "${#args[@]}" -ge 2 ]; then
@@ -39,6 +40,27 @@ case "$cmd $sub" in
   "pane list")
     cat "$state/pane-list.json"
     exit 0
+    ;;
+  "api snapshot")
+    snapshot_count=$(cat "$state/snapshot-count")
+    snapshot_count=$((snapshot_count + 1))
+    printf '%s\n' "$snapshot_count" > "$state/snapshot-count"
+    focused=$(cat "$state/focused-pane")
+    if [ "$snapshot_count" -ge 2 ] && [ -f "$state/focused-pane-after-first" ]; then
+      focused=$(cat "$state/focused-pane-after-first")
+    fi
+    printf '{"result":{"snapshot":{"focused_pane_id":"%s"}}}\n' "$focused"
+    exit 0
+    ;;
+  "agent get")
+    pane=${args[2]:-}
+    f="$state/agent-${pane}.json"
+    if [ -f "$f" ]; then
+      cat "$f"
+      exit 0
+    fi
+    printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
+    exit 1
     ;;
   "pane process-info")
     pane=
@@ -77,6 +99,9 @@ chmod +x "$FAKEBIN/herdr"
 export PATH="$FAKEBIN:$PATH"
 export FM_FAKE_HERDR_STATE="$STATE"
 export FM_FAKE_CLOSE_LOG="$CLOSE_LOG"
+: > "$STATE/focused-pane"
+: > "$STATE/calls.log"
+printf '%s\n' 0 > "$STATE/snapshot-count"
 
 write_pane_list() {
   cat > "$STATE/pane-list.json"
@@ -118,6 +143,12 @@ expect_code 2 "$code" "unknown flag exit"
 assert_contains "$out" "unknown argument" "unknown flag message"
 pass "unknown argument refuses"
 
+code=0
+out=$("$SCRIPT" --session --dry-run 2>&1) || code=$?
+expect_code 2 "$code" "missing --session value exit"
+assert_contains "$out" "--session requires a value" "missing --session value message"
+pass "--session refuses an option as its value"
+
 # --- missing herdr ----------------------------------------------------------
 
 empty_bin=$(fm_fakebin "$TMP_ROOT/no-herdr")
@@ -148,16 +179,18 @@ write_pane_list <<'JSON'
 {
   "result": {
     "panes": [
-      {"pane_id":"p-idle","tab_id":"t1","cwd":"/tmp/idle","focused":false,"agent":"","agent_status":""},
-      {"pane_id":"p-focused","tab_id":"t1","cwd":"/tmp/focus","focused":true,"agent":"","agent_status":""},
-      {"pane_id":"p-agent","tab_id":"t2","cwd":"/tmp/agent","focused":false,"agent":"claude","agent_status":"running"},
-      {"pane_id":"p-editor","tab_id":"t2","cwd":"/tmp/edit","focused":false,"agent":"","agent_status":""},
-      {"pane_id":"p-harness","tab_id":"t3","cwd":"/tmp/harness","focused":false,"agent":"","agent_status":""},
-      {"pane_id":"p-nonshell","tab_id":"t3","cwd":"/tmp/node","focused":false,"agent":"","agent_status":""}
+      {"pane_id":"p-idle","tab_id":"t1","cwd":"/tmp/idle"},
+      {"pane_id":"p-focused","tab_id":"t1","cwd":"/tmp/focus"},
+      {"pane_id":"p-agent","tab_id":"t2","cwd":"/tmp/agent"},
+      {"pane_id":"p-editor","tab_id":"t2","cwd":"/tmp/edit"},
+      {"pane_id":"p-harness","tab_id":"t3","cwd":"/tmp/harness"},
+      {"pane_id":"p-nonshell","tab_id":"t3","cwd":"/tmp/node"}
     ]
   }
 }
 JSON
+printf '%s\n' p-focused > "$STATE/focused-pane"
+printf '%s\n' '{"result":{"agent":{"agent":"claude","agent_status":"running"}}}' > "$STATE/agent-p-agent.json"
 write_process p-idle "$(fg_shell p-idle)"
 write_process p-focused "$(fg_shell p-focused)"
 write_process p-agent "$(fg_shell p-agent)"
@@ -204,12 +237,15 @@ write_pane_list <<'JSON'
 {
   "result": {
     "panes": [
-      {"pane_id":"p-a","tab_id":"t1","cwd":"/tmp/a","focused":false,"agent":"","agent_status":""},
-      {"pane_id":"p-b","tab_id":"t1","cwd":"/tmp/b","focused":false,"agent":"codex","agent_status":"idle"}
+      {"pane_id":"p-a","tab_id":"t1","cwd":"/tmp/a"},
+      {"pane_id":"p-b","tab_id":"t1","cwd":"/tmp/b"}
     ]
   }
 }
 JSON
+: > "$STATE/focused-pane"
+rm -f "$STATE/agent-p-agent.json"
+printf '%s\n' '{"result":{"agent":{"agent":"codex","agent_status":"idle"}}}' > "$STATE/agent-p-b.json"
 write_process p-a "$(fg_shell p-a)"
 write_process p-b "$(fg_shell p-b)"
 : > "$CLOSE_LOG"
@@ -222,6 +258,31 @@ echo "$out" | jq -e '.kept[0].pane_id == "p-b"' >/dev/null || fail "agent kept o
 closes=$(cat "$CLOSE_LOG")
 [ "$closes" = "p-a" ] || fail "close log expected only p-a, got: $closes"
 pass "live close closes only idle panes"
+
+snapshot_calls=$(grep -c '^api snapshot$' "$STATE/calls.log")
+agent_calls=$(grep -c '^agent get p-a$' "$STATE/calls.log")
+process_calls=$(grep -c '^pane process-info --pane p-a$' "$STATE/calls.log")
+[ "$snapshot_calls" -ge 2 ] || fail "live close must recheck snapshot"
+[ "$agent_calls" -eq 2 ] || fail "live close must recheck agent state"
+[ "$process_calls" -eq 2 ] || fail "live close must recheck process state"
+pass "live close revalidates all safety state"
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-race","tab_id":"t1","cwd":"/tmp/race"}]}}
+JSON
+: > "$STATE/focused-pane"
+printf '%s\n' p-race > "$STATE/focused-pane-after-first"
+printf '%s\n' 0 > "$STATE/snapshot-count"
+write_process p-race "$(fg_shell p-race)"
+: > "$CLOSE_LOG"
+code=0
+out=$("$SCRIPT" --json 2>&1) || code=$?
+expect_code 0 "$code" "focus race exit"
+echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-race" and (.kept[0].reason | test("changed before close: focused"))' >/dev/null \
+  || fail "newly focused pane must be kept: $out"
+[ ! -s "$CLOSE_LOG" ] || fail "newly focused pane must not be closed"
+rm "$STATE/focused-pane-after-first"
+pass "live close keeps a pane focused during scanning"
 
 # --- malformed process-info fails closed ------------------------------------
 
@@ -250,6 +311,17 @@ expect_code 0 "$code" "unidentified process dry-run exit"
 echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-unknown" and (.kept[0].reason | test("invalid process-info"))' >/dev/null \
   || fail "unidentified process must be kept: $out"
 pass "unidentified foreground process fails closed"
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-cmdline","tab_id":"t1","cwd":"/tmp/cmdline"}]}}
+JSON
+write_process p-cmdline '{"result":{"type":"pane_process_info","process_info":{"pane_id":"p-cmdline","foreground_processes":[{"cmdline":"node app.js"}]}}}'
+code=0
+out=$("$SCRIPT" --dry-run --json 2>&1) || code=$?
+expect_code 0 "$code" "cmdline-only process dry-run exit"
+echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-cmdline"' >/dev/null \
+  || fail "cmdline-only process must be kept: $out"
+pass "cmdline-only foreground process fails closed"
 
 # --- JSON reports close failures with nonzero status ------------------------
 

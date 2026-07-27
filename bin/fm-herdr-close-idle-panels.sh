@@ -35,8 +35,22 @@ while [[ $# -gt 0 ]]; do
     --dry-run|-n) DRY_RUN=1; shift ;;
     --include-focused) INCLUDE_FOCUSED=1; shift ;;
     --json) JSON_OUT=1; shift ;;
-    --session) SESSION=${2:-}; shift 2 ;;
-    --session=*) SESSION=${1#--session=}; shift ;;
+    --session)
+      [[ -n "${2:-}" && "$2" != -* ]] || {
+        echo "error: --session requires a value" >&2
+        usage 2
+      }
+      SESSION=$2
+      shift 2
+      ;;
+    --session=*)
+      SESSION=${1#--session=}
+      [[ -n "$SESSION" ]] || {
+        echo "error: --session requires a value" >&2
+        usage 2
+      }
+      shift
+      ;;
     -h|--help) usage 0 ;;
     *)
       echo "error: unknown argument: $1" >&2
@@ -123,6 +137,96 @@ is_shell_process() {
   return 1
 }
 
+pane_keep_reason() {
+  local pane_id=$1 snapshot agent_out agent agent_status pinfo
+  local name cmdline argv0
+  PANE_REASON=""
+
+  if [[ "$INCLUDE_FOCUSED" -eq 0 ]]; then
+    snapshot=$(herdr_cli api snapshot 2>/dev/null) || {
+      PANE_REASON="snapshot failed"
+      return
+    }
+    if ! printf '%s' "$snapshot" | jq -e '
+      (.result.snapshot.focused_pane_id | type) == "string"
+    ' >/dev/null 2>&1; then
+      PANE_REASON="invalid snapshot response"
+      return
+    fi
+    if [[ "$(printf '%s' "$snapshot" | jq -r '.result.snapshot.focused_pane_id')" == "$pane_id" ]]; then
+      PANE_REASON="focused (use --include-focused to allow)"
+      return
+    fi
+  fi
+
+  if agent_out=$(herdr_cli agent get "$pane_id" 2>&1); then
+    if ! printf '%s' "$agent_out" | jq -e '
+      (.result.agent | type) == "object"
+      and ((.result.agent.agent // "") | type) == "string"
+      and ((.result.agent.agent_status // "") | type) == "string"
+    ' >/dev/null 2>&1; then
+      PANE_REASON="invalid agent response"
+      return
+    fi
+    agent=$(printf '%s' "$agent_out" | jq -r '.result.agent.agent // empty')
+    agent_status=$(printf '%s' "$agent_out" | jq -r '.result.agent.agent_status // empty')
+    PANE_REASON="agent harness open: ${agent:-registered} (${agent_status:-unknown})"
+    return
+  elif ! printf '%s' "$agent_out" | jq -e '.error.code == "agent_not_found"' >/dev/null 2>&1; then
+    PANE_REASON="agent query failed"
+    return
+  fi
+
+  pinfo=$(herdr_cli pane process-info --pane "$pane_id" 2>/dev/null) || {
+    PANE_REASON="process-info failed"
+    return
+  }
+  if ! printf '%s' "$pinfo" | jq -e --arg pane "$pane_id" '
+    .result.type == "pane_process_info"
+    and .result.process_info.pane_id == $pane
+    and (.result.process_info.foreground_processes | type) == "array"
+    and all(
+      .result.process_info.foreground_processes[];
+      type == "object"
+      and ((.name // "") | type) == "string"
+      and ((.cmdline // "") | type) == "string"
+      and ((.argv0 // "") | type) == "string"
+      and ([.name // "", .argv0 // ""] | any(length > 0))
+    )
+  ' >/dev/null 2>&1; then
+    PANE_REASON="invalid process-info response"
+    return
+  fi
+
+  while IFS=$'\t' read -r name cmdline argv0; do
+    [[ -z "${name:-}" && -z "${argv0:-}" ]] && continue
+    if is_harness_process "$name" "$cmdline" "$argv0"; then
+      PANE_REASON="harness process: ${name:-$argv0}"
+      return
+    fi
+    if is_editor_process "$name" "$cmdline" "$argv0"; then
+      PANE_REASON="editor open: ${name:-$argv0}"
+      return
+    fi
+  done < <(printf '%s' "$pinfo" | jq -r '
+    .result.process_info.foreground_processes[]
+    | [(.name // ""), (.cmdline // ""), (.argv0 // "")]
+    | @tsv
+  ')
+
+  while IFS=$'\t' read -r name cmdline argv0; do
+    [[ -z "${name:-}" && -z "${argv0:-}" ]] && continue
+    if ! is_shell_process "$name" "$argv0"; then
+      PANE_REASON="non-shell process: ${name:-$argv0}"
+      break
+    fi
+  done < <(printf '%s' "$pinfo" | jq -r '
+    .result.process_info.foreground_processes[]
+    | [(.name // ""), (.cmdline // ""), (.argv0 // "")]
+    | @tsv
+  ')
+}
+
 list_json=$(herdr_cli pane list 2>/dev/null) || {
   echo "error: herdr pane list failed (is the server running?)" >&2
   exit 1
@@ -151,80 +255,11 @@ for pane_id in "${PANE_IDS[@]:-}"; do
   [[ -z "$pane_id" ]] && continue
 
   meta=$(printf '%s' "$list_json" | jq -c --arg id "$pane_id" '.result.panes[] | select(.pane_id == $id)')
-  agent=$(printf '%s' "$meta" | jq -r '.agent // empty')
-  agent_status=$(printf '%s' "$meta" | jq -r '.agent_status // empty')
-  focused=$(printf '%s' "$meta" | jq -r '.focused // false')
   cwd=$(printf '%s' "$meta" | jq -r '.cwd // .foreground_cwd // empty')
   tab_id=$(printf '%s' "$meta" | jq -r '.tab_id // empty')
 
-  reason=""
-
-  if [[ "$focused" == "true" && "$INCLUDE_FOCUSED" -eq 0 ]]; then
-    reason="focused (use --include-focused to allow)"
-  elif [[ -n "$agent" ]]; then
-    reason="agent harness open: ${agent} (${agent_status:-unknown})"
-  else
-    pinfo=$(herdr_cli pane process-info --pane "$pane_id" 2>/dev/null) || {
-      reason="process-info failed"
-      kept+=("$pane_id|$reason|$cwd|$tab_id")
-      KEPT_COUNT=$((KEPT_COUNT + 1))
-      continue
-    }
-    if ! printf '%s' "$pinfo" | jq -e --arg pane "$pane_id" '
-      .result.type == "pane_process_info"
-      and .result.process_info.pane_id == $pane
-      and (.result.process_info.foreground_processes | type) == "array"
-      and all(
-        .result.process_info.foreground_processes[];
-        type == "object"
-        and ((.name // "") | type) == "string"
-        and ((.cmdline // "") | type) == "string"
-        and ((.argv0 // "") | type) == "string"
-        and ([.name // "", .cmdline // "", .argv0 // ""] | any(length > 0))
-      )
-    ' >/dev/null 2>&1; then
-      reason="invalid process-info response"
-      kept+=("$pane_id|$reason|$cwd|$tab_id")
-      KEPT_COUNT=$((KEPT_COUNT + 1))
-      continue
-    fi
-    # Inspect each foreground process
-    while IFS=$'\t' read -r name cmdline argv0; do
-      [[ -z "${name:-}" && -z "${cmdline:-}" && -z "${argv0:-}" ]] && continue
-      if is_harness_process "$name" "$cmdline" "$argv0"; then
-        reason="harness process: ${name:-$argv0}"
-        break
-      fi
-      if is_editor_process "$name" "$cmdline" "$argv0"; then
-        reason="editor open: ${name:-$argv0}"
-        break
-      fi
-    done < <(printf '%s' "$pinfo" | jq -r '
-      .result.process_info.foreground_processes[]?
-      | [(.name // ""), (.cmdline // ""), (.argv0 // "")]
-      | @tsv
-    ')
-
-    if [[ -z "$reason" ]]; then
-      # Require every foreground process to be a shell (or no processes)
-      non_shell=0
-      while IFS=$'\t' read -r name cmdline argv0; do
-        [[ -z "${name:-}" && -z "${argv0:-}" ]] && continue
-        if ! is_shell_process "$name" "$argv0"; then
-          non_shell=1
-          reason="non-shell process: ${name:-$argv0}"
-          break
-        fi
-      done < <(printf '%s' "$pinfo" | jq -r '
-        .result.process_info.foreground_processes[]?
-        | [(.name // ""), (.cmdline // ""), (.argv0 // "")]
-        | @tsv
-      ')
-      if [[ "$non_shell" -eq 0 && -z "$reason" ]]; then
-        reason="" # idle
-      fi
-    fi
-  fi
+  pane_keep_reason "$pane_id"
+  reason=$PANE_REASON
 
   if [[ -n "$reason" ]]; then
     kept+=("$pane_id|$reason|$cwd|$tab_id")
@@ -236,6 +271,14 @@ for pane_id in "${PANE_IDS[@]:-}"; do
   if [[ "$DRY_RUN" -eq 1 ]]; then
     closed+=("$pane_id|dry-run|$cwd|$tab_id")
     CLOSED_COUNT=$((CLOSED_COUNT + 1))
+    continue
+  fi
+
+  pane_keep_reason "$pane_id"
+  reason=$PANE_REASON
+  if [[ -n "$reason" ]]; then
+    kept+=("$pane_id|changed before close: $reason|$cwd|$tab_id")
+    KEPT_COUNT=$((KEPT_COUNT + 1))
     continue
   fi
 
