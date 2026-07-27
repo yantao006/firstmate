@@ -352,6 +352,19 @@ echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-cmdline"' >/
   || fail "cmdline-only process must be kept: $out"
 pass "cmdline-only foreground process fails closed"
 
+# --- empty leading process fields remain aligned ----------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-empty-name","tab_id":"t1","cwd":"/tmp/empty-name"}]}}
+JSON
+write_process p-empty-name '{"result":{"type":"pane_process_info","process_info":{"pane_id":"p-empty-name","foreground_processes":[{"name":"","cmdline":"-zsh","argv0":"/bin/zsh"}]}}}'
+code=0
+out=$("$SCRIPT" --dry-run --json 2>&1) || code=$?
+expect_code 0 "$code" "empty process name dry-run exit"
+echo "$out" | jq -e '.counts.closed == 1 and .closed[0].pane_id == "p-empty-name"' >/dev/null \
+  || fail "empty process name must not shift argv0 fields: $out"
+pass "empty process fields remain aligned"
+
 # --- JSON reports close failures with nonzero status ------------------------
 
 write_pane_list <<'JSON'

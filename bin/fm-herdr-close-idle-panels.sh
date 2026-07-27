@@ -200,8 +200,10 @@ pane_keep_reason() {
     return
   fi
 
-  while IFS=$'\t' read -r name cmdline argv0; do
-    [[ -z "${name:-}" && -z "${argv0:-}" ]] && continue
+  while IFS= read -r process_json; do
+    name=$(printf '%s' "$process_json" | jq -r '.name // ""')
+    cmdline=$(printf '%s' "$process_json" | jq -r '.cmdline // ""')
+    argv0=$(printf '%s' "$process_json" | jq -r '.argv0 // ""')
     if is_harness_process "$name" "$cmdline" "$argv0"; then
       PANE_REASON="harness process: ${name:-$argv0}"
       return
@@ -210,23 +212,11 @@ pane_keep_reason() {
       PANE_REASON="editor open: ${name:-$argv0}"
       return
     fi
-  done < <(printf '%s' "$pinfo" | jq -r '
-    .result.process_info.foreground_processes[]
-    | [(.name // ""), (.cmdline // ""), (.argv0 // "")]
-    | @tsv
-  ')
-
-  while IFS=$'\t' read -r name cmdline argv0; do
-    [[ -z "${name:-}" && -z "${argv0:-}" ]] && continue
     if ! is_shell_process "$name" "$argv0"; then
       PANE_REASON="non-shell process: ${name:-$argv0}"
-      break
+      return
     fi
-  done < <(printf '%s' "$pinfo" | jq -r '
-    .result.process_info.foreground_processes[]
-    | [(.name // ""), (.cmdline // ""), (.argv0 // "")]
-    | @tsv
-  ')
+  done < <(printf '%s' "$pinfo" | jq -c '.result.process_info.foreground_processes[]')
 }
 
 close_pane_focus_preserving() {
