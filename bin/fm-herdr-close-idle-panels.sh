@@ -14,18 +14,15 @@
 #   fm-herdr-close-idle-panels.sh --json       # machine-readable summary
 #
 # Safety:
-#   - Never closes the focused pane unless --include-focused is set
-#   - Never closes a pane that reports a non-empty herdr "agent" label
-#   - Never closes a pane whose foreground process looks like a harness or editor
+#   - Rechecks and skips the focused pane unless --include-focused is set
+#   - Rechecks and skips panes with a non-empty herdr "agent" label
+#   - Rechecks and skips panes whose foreground process looks like a harness or editor
+#   - Herdr has no atomic conditional close, so state may change after the final best-effort recheck
 #   - Does not kill firstmate tasks' metadata; only closes Herdr panes
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$SCRIPT_DIR/backends/herdr.sh"
-. "$SCRIPT_DIR/fm-wake-lib.sh"
-
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -234,16 +231,7 @@ pane_keep_reason() {
 
 close_pane_focus_preserving() {
   local pane_id=$1 before after focused_pane focused_tab focused_workspace
-  local restored info target_tab
-  info=$(herdr_cli pane get "$pane_id" 2>/dev/null) || return 1
-  if ! printf '%s' "$info" | jq -e --arg pane "$pane_id" '
-    .result.pane.pane_id == $pane
-    and (.result.pane.tab_id | type) == "string"
-    and (.result.pane.tab_id | length) > 0
-  ' >/dev/null 2>&1; then
-    return 1
-  fi
-  target_tab=$(printf '%s' "$info" | jq -r '.result.pane.tab_id')
+  local restored info
   before=$(herdr_cli api snapshot 2>/dev/null) || return 1
   if ! printf '%s' "$before" | jq -e '
     .result.snapshot as $s
@@ -260,9 +248,6 @@ close_pane_focus_preserving() {
   focused_tab=$(printf '%s' "$before" | jq -r '.result.snapshot.focused_tab_id')
   focused_workspace=$(printf '%s' "$before" | jq -r '.result.snapshot.focused_workspace_id')
   if [[ "$INCLUDE_FOCUSED" -eq 0 && "$focused_pane" == "$pane_id" ]]; then
-    return 2
-  fi
-  if [[ "$target_tab" == "$focused_tab" && "$focused_pane" != "$pane_id" ]]; then
     return 2
   fi
   herdr_cli pane close "$pane_id" >/dev/null 2>&1 || return 1
@@ -318,19 +303,25 @@ if ! printf '%s' "$list_json" | jq -e '
 fi
 
 PANE_IDS=()
+PANE_COUNT=0
 while IFS= read -r pane_id; do
   PANE_IDS+=("$pane_id")
+  PANE_COUNT=$((PANE_COUNT + 1))
 done < <(printf '%s' "$list_json" | jq -r '.result.panes[]?.pane_id // empty')
 
 closed=()
 kept=()
 errors=()
+aborted=()
 CLOSED_COUNT=0
 KEPT_COUNT=0
 ERROR_COUNT=0
+ABORTED_COUNT=0
 STOP_CLOSING=0
+PANE_INDEX=-1
 
 for pane_id in "${PANE_IDS[@]:-}"; do
+  PANE_INDEX=$((PANE_INDEX + 1))
   [[ -z "$pane_id" ]] && continue
 
   meta=$(printf '%s' "$list_json" | jq -c --arg id "$pane_id" '.result.panes[] | select(.pane_id == $id)')
@@ -353,37 +344,16 @@ for pane_id in "${PANE_IDS[@]:-}"; do
     continue
   fi
 
-  focus_lock=
-  focus_lock_held=0
-  lock_attempt=0
-  if focus_lock=$(fm_backend_herdr_presentation_session_lock_path "${SESSION:-default}" 2>/dev/null); then
-    while [[ "$lock_attempt" -lt 50 ]]; do
-      if fm_lock_try_acquire "$focus_lock"; then
-        focus_lock_held=1
-        break
-      fi
-      sleep 0.1
-      lock_attempt=$((lock_attempt + 1))
-    done
-  fi
-  if [[ "$focus_lock_held" -ne 1 ]]; then
-    kept+=("$(json_record "$pane_id" "focus lock unavailable" "$cwd" "$tab_id" reason)")
-    KEPT_COUNT=$((KEPT_COUNT + 1))
-    continue
-  fi
-
   pane_keep_reason "$pane_id"
   reason=$PANE_REASON
   if [[ -n "$reason" ]]; then
     kept+=("$(json_record "$pane_id" "changed before close: $reason" "$cwd" "$tab_id" reason)")
     KEPT_COUNT=$((KEPT_COUNT + 1))
-    fm_lock_release "$focus_lock"
     continue
   fi
 
   close_status=0
   close_pane_focus_preserving "$pane_id" || close_status=$?
-  fm_lock_release "$focus_lock"
   if [[ "$close_status" -eq 0 ]]; then
     closed+=("$(json_record "$pane_id" closed "$cwd" "$tab_id" action)")
     CLOSED_COUNT=$((CLOSED_COUNT + 1))
@@ -400,7 +370,19 @@ for pane_id in "${PANE_IDS[@]:-}"; do
     errors+=("$(json_record "$pane_id" "close or focus restoration failed" "$cwd" "$tab_id" error)")
     ERROR_COUNT=$((ERROR_COUNT + 1))
   fi
-  [[ "$STOP_CLOSING" -eq 0 ]] || break
+  if [[ "$STOP_CLOSING" -ne 0 ]]; then
+    abort_index=$((PANE_INDEX + 1))
+    while [[ "$abort_index" -lt "$PANE_COUNT" ]]; do
+      abort_id=${PANE_IDS[$abort_index]}
+      abort_meta=$(printf '%s' "$list_json" | jq -c --arg id "$abort_id" '.result.panes[] | select(.pane_id == $id)')
+      abort_cwd=$(printf '%s' "$abort_meta" | jq -r '.cwd // .foreground_cwd // empty')
+      abort_tab=$(printf '%s' "$abort_meta" | jq -r '.tab_id // empty')
+      aborted+=("$(json_record "$abort_id" "not checked after focus restoration failure" "$abort_cwd" "$abort_tab" reason)")
+      ABORTED_COUNT=$((ABORTED_COUNT + 1))
+      abort_index=$((abort_index + 1))
+    done
+    break
+  fi
 done
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
@@ -410,8 +392,9 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
     --argjson closed "$(printf '%s\n' "${closed[@]:-}" | jq -s -c '.')" \
     --argjson kept "$(printf '%s\n' "${kept[@]:-}" | jq -s -c '.')" \
     --argjson errors "$(printf '%s\n' "${errors[@]:-}" | jq -s -c '.')" \
-    '{session:$session, dry_run:($dry==1), closed:$closed, kept:$kept, errors:$errors,
-      counts:{closed:($closed|length), kept:($kept|length), errors:($errors|length)}}'
+    --argjson aborted "$(printf '%s\n' "${aborted[@]:-}" | jq -s -c '.')" \
+    '{session:$session, dry_run:($dry==1), closed:$closed, kept:$kept, errors:$errors, aborted:$aborted,
+      counts:{closed:($closed|length), kept:($kept|length), errors:($errors|length), aborted:($aborted|length)}}'
   if [[ "$ERROR_COUNT" -gt 0 ]]; then
     exit 1
   fi
@@ -441,6 +424,15 @@ fi
 if [[ "$KEPT_COUNT" -gt 0 ]]; then
   echo "kept ($KEPT_COUNT):"
   for row in "${kept[@]:-}"; do
+    IFS=$'\t' read -r id reason cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.reason,.cwd,.tab_id]|@tsv')
+    echo "  $id  $reason  tab=$tab"
+  done
+  echo
+fi
+
+if [[ "$ABORTED_COUNT" -gt 0 ]]; then
+  echo "aborted ($ABORTED_COUNT):"
+  for row in "${aborted[@]:-}"; do
     IFS=$'\t' read -r id reason cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.reason,.cwd,.tab_id]|@tsv')
     echo "  $id  $reason  tab=$tab"
   done

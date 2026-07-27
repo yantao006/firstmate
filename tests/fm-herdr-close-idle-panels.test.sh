@@ -41,27 +41,17 @@ case "$cmd $sub" in
     cat "$state/pane-list.json"
     exit 0
     ;;
-  "pane get")
-    pane=${args[2]:-}
-    jq -c --arg pane "$pane" '
-      .result.panes[] | select(.pane_id == $pane) | {result:{pane:.}}
-    ' "$state/pane-list.json"
-    exit 0
-    ;;
-  "session list")
-    printf '{"sessions":[{"name":"default","running":true,"socket_path":"%s/fake.sock"}]}\n' "$state"
-    exit 0
-    ;;
   "api snapshot")
     snapshot_count=$(cat "$state/snapshot-count")
     snapshot_count=$((snapshot_count + 1))
     printf '%s\n' "$snapshot_count" > "$state/snapshot-count"
     focused=$(cat "$state/focused-pane")
+    focused_tab=$(cat "$state/focused-tab")
     focus_switch_count=$(cat "$state/focus-switch-count")
     if [ "$snapshot_count" -ge "$focus_switch_count" ] && [ -f "$state/focused-pane-after-first" ]; then
       focused=$(cat "$state/focused-pane-after-first")
     fi
-    printf '{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"t-focus","focused_pane_id":"%s"}}}\n' "$focused"
+    printf '{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"%s","focused_pane_id":"%s"}}}\n' "$focused_tab" "$focused"
     exit 0
     ;;
   "agent get")
@@ -115,6 +105,7 @@ export PATH="$FAKEBIN:$PATH"
 export FM_FAKE_HERDR_STATE="$STATE"
 export FM_FAKE_CLOSE_LOG="$CLOSE_LOG"
 printf '%s\n' p-captain > "$STATE/focused-pane"
+printf '%s\n' t-focus > "$STATE/focused-tab"
 : > "$STATE/calls.log"
 printf '%s\n' 0 > "$STATE/snapshot-count"
 printf '%s\n' 2 > "$STATE/focus-switch-count"
@@ -151,6 +142,7 @@ assert_contains "$out" "--dry-run" "--help lists --dry-run"
 assert_contains "$out" "--include-focused" "--help lists --include-focused"
 assert_contains "$out" "--session" "--help lists --session"
 assert_contains "$out" "--json" "--help lists --json"
+[ ! -s "$STATE/calls.log" ] || fail "--help must not invoke herdr or load stateful backend helpers"
 pass "help and flag documentation"
 
 code=0
@@ -260,6 +252,7 @@ write_pane_list <<'JSON'
 }
 JSON
 printf '%s\n' p-captain > "$STATE/focused-pane"
+printf '%s\n' t1 > "$STATE/focused-tab"
 rm -f "$STATE/agent-p-agent.json"
 printf '%s\n' '{"result":{"agent":{"agent":"codex","agent_status":"idle"}}}' > "$STATE/agent-p-b.json"
 write_process p-a "$(fg_shell p-a)"
@@ -276,6 +269,7 @@ echo "$out" | jq -e '.kept[0].pane_id == "p-b"' >/dev/null || fail "agent kept o
 closes=$(cat "$CLOSE_LOG")
 [ "$closes" = "p-a" ] || fail "close log expected only p-a, got: $closes"
 pass "live close closes only idle panes"
+printf '%s\n' t-focus > "$STATE/focused-tab"
 
 snapshot_calls=$(grep -c '^api snapshot$' "$STATE/calls.log")
 agent_calls=$(grep -c '^agent get p-a$' "$STATE/calls.log")
@@ -393,6 +387,8 @@ echo "$out" | jq -e '
   and .closed[0].pane_id == "p-restore-fail"
   and .counts.errors == 1
   and (.errors[0].error | test("focus restoration failed"))
+  and .counts.aborted == 1
+  and .aborted[0].pane_id == "p-after-fail"
 ' >/dev/null || fail "closed pane and focus failure must both be reported: $out"
 [ "$(cat "$CLOSE_LOG")" = p-restore-fail ] || fail "closing must stop after focus restoration failure"
 rm "$STATE/focus-steal-p-restore-fail"
