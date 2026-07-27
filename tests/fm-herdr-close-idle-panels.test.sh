@@ -423,15 +423,18 @@ pass "human summary preserves empty cwd fields"
 # --- human summary escapes control characters -------------------------------
 
 write_pane_list <<'JSON'
-{"result":{"panes":[{"pane_id":"p-control","tab_id":"t-control","cwd":"/tmp/line\n\u001b[31mred\u009b32mgreen"}]}}
+{"result":{"panes":[{"pane_id":"p-control","tab_id":"t-control","cwd":"/tmp/line\n\u001b[31mred\u007f\u009b32mgreen\u202ereversed\u2066isolated"}]}}
 JSON
 write_process p-control "$(fg_shell p-control)"
 code=0
 out=$("$SCRIPT" --dry-run 2>&1) || code=$?
 expect_code 0 "$code" "human control-character exit"
-assert_contains "$out" 'cwd="/tmp/line\n\u001b[31mred\u009b32mgreen"' "human control characters escaped"
+assert_contains "$out" 'cwd="/tmp/line\u000a\u001b[31mred\u007f\u009b32mgreen\u202ereversed\u2066isolated"' "human control characters escaped"
 assert_not_contains "$out" $'\033' "human output contains no raw escape"
+assert_not_contains "$out" $'\177' "human output contains no raw delete"
 assert_not_contains "$out" $'\302\233' "human output contains no raw C1 control"
+assert_not_contains "$out" $'\342\200\256' "human output contains no raw bidi override"
+assert_not_contains "$out" $'\342\201\246' "human output contains no raw bidi isolate"
 pass "human summary escapes control characters"
 
 # --- malformed pane list is rejected ----------------------------------------
@@ -468,13 +471,16 @@ pass "--session is forwarded to herdr and reported in json"
 
 # --- human session escapes control characters -------------------------------
 
-session_value=$'lab\n\033[31mred\302\23332mgreen'
+session_value=$'lab\n\033[31mred\177\302\23332mgreen\342\200\256reversed\342\201\246isolated'
 code=0
 out=$("$SCRIPT" --session "$session_value" --dry-run 2>&1) || code=$?
 expect_code 0 "$code" "human session control-character exit"
-assert_contains "$out" 'session: "lab\n\u001b[31mred\u009b32mgreen"' "human session control characters escaped"
+assert_contains "$out" 'session: "lab\u000a\u001b[31mred\u007f\u009b32mgreen\u202ereversed\u2066isolated"' "human session control characters escaped"
 assert_not_contains "$out" $'\033' "human session output contains no raw escape"
+assert_not_contains "$out" $'\177' "human session output contains no raw delete"
 assert_not_contains "$out" $'\302\233' "human session output contains no raw C1 control"
+assert_not_contains "$out" $'\342\200\256' "human session output contains no raw bidi override"
+assert_not_contains "$out" $'\342\201\246' "human session output contains no raw bidi isolate"
 pass "human session escapes control characters"
 
 # --- human dry-run mode line ------------------------------------------------

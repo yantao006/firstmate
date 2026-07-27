@@ -394,14 +394,24 @@ fi
 VISIBLE_JSON_JQ='
 def hex_digit:
   ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"][.];
-def hex2:
+def hex4:
   . as $value
-  | (($value / 16 | floor) | hex_digit) + (($value % 16) | hex_digit);
+  | [4096, 256, 16, 1]
+  | map((($value / . | floor) % 16) | hex_digit)
+  | join("");
+def unicode_escape:
+  if . <= 65535 then
+    "\\u" + (. | hex4)
+  else
+    (. - 65536) as $value
+    | "\\u" + (55296 + ($value / 1024 | floor) | hex4)
+      + "\\u" + (56320 + ($value % 1024) | hex4)
+  end;
 def visible_json:
   explode
   | map(
-      if . >= 128 and . <= 159 then
-        "\\u00" + (. | hex2)
+      if ([.] | implode | test("^[\\p{Cc}\\p{Cf}]$")) then
+        . | unicode_escape
       else
         ([.] | implode | tojson)[1:-1]
       end
