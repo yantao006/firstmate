@@ -391,6 +391,7 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
   exit 0
 fi
 
+# shellcheck disable=SC2016 # Dollar expressions belong to jq, not the shell.
 VISIBLE_JSON_JQ='
 def hex_digit:
   ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"][.];
