@@ -391,7 +391,25 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
   exit 0
 fi
 
-printf 'session: %s\n' "$(jq -rn --arg value "${SESSION:-default (implicit)}" '$value | tojson')"
+VISIBLE_JSON_JQ='
+def hex_digit:
+  ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"][.];
+def hex2:
+  . as $value
+  | (($value / 16 | floor) | hex_digit) + (($value % 16) | hex_digit);
+def visible_json:
+  explode
+  | map(
+      if . >= 128 and . <= 159 then
+        "\\u00" + (. | hex2)
+      else
+        ([.] | implode | tojson)[1:-1]
+      end
+    )
+  | "\"" + join("") + "\"";
+'
+
+printf 'session: %s\n' "$(jq -rn --arg value "${SESSION:-default (implicit)}" "${VISIBLE_JSON_JQ}"'$value | visible_json')"
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "mode: dry-run (no panes closed)"
 else
@@ -402,7 +420,7 @@ echo
 if [[ "$CLOSED_COUNT" -gt 0 ]]; then
   echo "idle ($CLOSED_COUNT):"
   for row in "${closed[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  action=\(.action | tojson)  tab=\(.tab_id | tojson)  cwd=\((if .cwd == "" then "?" else .cwd end) | tojson)"'
+    printf '%s' "$row" | jq -r "${VISIBLE_JSON_JQ}"'"  pane_id=\(.pane_id | visible_json)  action=\(.action | visible_json)  tab=\(.tab_id | visible_json)  cwd=\((if .cwd == "" then "?" else .cwd end) | visible_json)"'
   done
   echo
 else
@@ -413,7 +431,7 @@ fi
 if [[ "$KEPT_COUNT" -gt 0 ]]; then
   echo "kept ($KEPT_COUNT):"
   for row in "${kept[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  reason=\(.reason | tojson)  tab=\(.tab_id | tojson)"'
+    printf '%s' "$row" | jq -r "${VISIBLE_JSON_JQ}"'"  pane_id=\(.pane_id | visible_json)  reason=\(.reason | visible_json)  tab=\(.tab_id | visible_json)"'
   done
   echo
 fi
@@ -421,7 +439,7 @@ fi
 if [[ "$ABORTED_COUNT" -gt 0 ]]; then
   echo "aborted ($ABORTED_COUNT):"
   for row in "${aborted[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  reason=\(.reason | tojson)  tab=\(.tab_id | tojson)"'
+    printf '%s' "$row" | jq -r "${VISIBLE_JSON_JQ}"'"  pane_id=\(.pane_id | visible_json)  reason=\(.reason | visible_json)  tab=\(.tab_id | visible_json)"'
   done
   echo
 fi
@@ -429,7 +447,7 @@ fi
 if [[ "$ERROR_COUNT" -gt 0 ]]; then
   echo "errors ($ERROR_COUNT):" >&2
   for row in "${errors[@]:-}"; do
-    printf '%s' "$row" | jq -r '"  pane_id=\(.pane_id | tojson)  error=\(.error | tojson)"' >&2
+    printf '%s' "$row" | jq -r "${VISIBLE_JSON_JQ}"'"  pane_id=\(.pane_id | visible_json)  error=\(.error | visible_json)"' >&2
   done
   exit 1
 fi
