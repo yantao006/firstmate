@@ -127,17 +127,27 @@ list_json=$(herdr_cli pane list 2>/dev/null) || {
   echo "error: herdr pane list failed (is the server running?)" >&2
   exit 1
 }
+if ! printf '%s' "$list_json" | jq -e '
+  (.result.panes | type) == "array"
+  and all(.result.panes[]; type == "object" and (.pane_id | type) == "string" and (.pane_id | length) > 0)
+' >/dev/null 2>&1; then
+  echo "error: herdr pane list returned an invalid response" >&2
+  exit 1
+fi
 
 PANE_IDS=()
 while IFS= read -r pane_id; do
-  [[ -n "$pane_id" ]] && PANE_IDS+=("$pane_id")
+  PANE_IDS+=("$pane_id")
 done < <(printf '%s' "$list_json" | jq -r '.result.panes[]?.pane_id // empty')
 
 closed=()
 kept=()
 errors=()
+CLOSED_COUNT=0
+KEPT_COUNT=0
+ERROR_COUNT=0
 
-for pane_id in "${PANE_IDS[@]}"; do
+for pane_id in "${PANE_IDS[@]:-}"; do
   [[ -z "$pane_id" ]] && continue
 
   meta=$(printf '%s' "$list_json" | jq -c --arg id "$pane_id" '.result.panes[] | select(.pane_id == $id)')
@@ -157,15 +167,25 @@ for pane_id in "${PANE_IDS[@]}"; do
     pinfo=$(herdr_cli pane process-info --pane "$pane_id" 2>/dev/null) || {
       reason="process-info failed"
       kept+=("$pane_id|$reason|$cwd|$tab_id")
+      KEPT_COUNT=$((KEPT_COUNT + 1))
       continue
     }
     if ! printf '%s' "$pinfo" | jq -e --arg pane "$pane_id" '
       .result.type == "pane_process_info"
       and .result.process_info.pane_id == $pane
       and (.result.process_info.foreground_processes | type) == "array"
+      and all(
+        .result.process_info.foreground_processes[];
+        type == "object"
+        and ((.name // "") | type) == "string"
+        and ((.cmdline // "") | type) == "string"
+        and ((.argv0 // "") | type) == "string"
+        and ([.name // "", .cmdline // "", .argv0 // ""] | any(length > 0))
+      )
     ' >/dev/null 2>&1; then
       reason="invalid process-info response"
       kept+=("$pane_id|$reason|$cwd|$tab_id")
+      KEPT_COUNT=$((KEPT_COUNT + 1))
       continue
     fi
     # Inspect each foreground process
@@ -208,19 +228,23 @@ for pane_id in "${PANE_IDS[@]}"; do
 
   if [[ -n "$reason" ]]; then
     kept+=("$pane_id|$reason|$cwd|$tab_id")
+    KEPT_COUNT=$((KEPT_COUNT + 1))
     continue
   fi
 
   # Idle → close (or dry-run)
   if [[ "$DRY_RUN" -eq 1 ]]; then
     closed+=("$pane_id|dry-run|$cwd|$tab_id")
+    CLOSED_COUNT=$((CLOSED_COUNT + 1))
     continue
   fi
 
   if herdr_cli pane close "$pane_id" >/dev/null 2>&1; then
     closed+=("$pane_id|closed|$cwd|$tab_id")
+    CLOSED_COUNT=$((CLOSED_COUNT + 1))
   else
     errors+=("$pane_id|close failed|$cwd|$tab_id")
+    ERROR_COUNT=$((ERROR_COUNT + 1))
   fi
 done
 
@@ -233,7 +257,7 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
     --argjson errors "$(printf '%s\n' "${errors[@]:-}" | jq -R -s -c 'split("\n")|map(select(length>0)|split("|")|{pane_id:.[0],error:.[1],cwd:.[2],tab_id:.[3]})')" \
     '{session:$session, dry_run:($dry==1), closed:$closed, kept:$kept, errors:$errors,
       counts:{closed:($closed|length), kept:($kept|length), errors:($errors|length)}}'
-  if [[ ${#errors[@]} -gt 0 ]]; then
+  if [[ "$ERROR_COUNT" -gt 0 ]]; then
     exit 1
   fi
   exit 0
@@ -247,9 +271,9 @@ else
 fi
 echo
 
-if [[ ${#closed[@]} -gt 0 ]]; then
-  echo "idle (${#closed[@]}):"
-  for row in "${closed[@]}"; do
+if [[ "$CLOSED_COUNT" -gt 0 ]]; then
+  echo "idle ($CLOSED_COUNT):"
+  for row in "${closed[@]:-}"; do
     IFS='|' read -r id action cwd tab <<<"$row"
     echo "  $id  [$action]  tab=$tab  cwd=${cwd:-?}"
   done
@@ -259,18 +283,18 @@ else
   echo
 fi
 
-if [[ ${#kept[@]} -gt 0 ]]; then
-  echo "kept (${#kept[@]}):"
-  for row in "${kept[@]}"; do
+if [[ "$KEPT_COUNT" -gt 0 ]]; then
+  echo "kept ($KEPT_COUNT):"
+  for row in "${kept[@]:-}"; do
     IFS='|' read -r id reason cwd tab <<<"$row"
     echo "  $id  $reason  tab=$tab"
   done
   echo
 fi
 
-if [[ ${#errors[@]} -gt 0 ]]; then
-  echo "errors (${#errors[@]}):" >&2
-  for row in "${errors[@]}"; do
+if [[ "$ERROR_COUNT" -gt 0 ]]; then
+  echo "errors ($ERROR_COUNT):" >&2
+  for row in "${errors[@]:-}"; do
     IFS='|' read -r id err cwd tab <<<"$row"
     echo "  $id  $err" >&2
   done

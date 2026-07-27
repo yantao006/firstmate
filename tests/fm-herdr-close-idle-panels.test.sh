@@ -237,6 +237,20 @@ echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-malformed" a
   || fail "malformed process-info must be kept: $out"
 pass "malformed process-info fails closed"
 
+# --- unidentified foreground process fails closed ---------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-unknown","tab_id":"t1","cwd":"/tmp/unknown","focused":false,"agent":""}]}}
+JSON
+write_process p-unknown '{"result":{"type":"pane_process_info","process_info":{"pane_id":"p-unknown","foreground_processes":[{"pid":42}]}}}'
+: > "$CLOSE_LOG"
+code=0
+out=$("$SCRIPT" --dry-run --json 2>&1) || code=$?
+expect_code 0 "$code" "unidentified process dry-run exit"
+echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-unknown" and (.kept[0].reason | test("invalid process-info"))' >/dev/null \
+  || fail "unidentified process must be kept: $out"
+pass "unidentified foreground process fails closed"
+
 # --- JSON reports close failures with nonzero status ------------------------
 
 write_pane_list <<'JSON'
@@ -251,6 +265,15 @@ echo "$out" | jq -e '.counts.errors == 1 and .errors[0].pane_id == "p-fail"' >/d
   || fail "JSON close failure summary: $out"
 rm "$STATE/close-fail-p-fail"
 pass "JSON close failures return nonzero"
+
+# --- malformed pane list is rejected ----------------------------------------
+
+printf '%s\n' '{"result":{"panes":{}}}' > "$STATE/pane-list.json"
+code=0
+out=$("$SCRIPT" --dry-run --json 2>&1) || code=$?
+expect_code 1 "$code" "malformed pane-list exit"
+assert_contains "$out" "pane list returned an invalid response" "malformed pane-list message"
+pass "malformed pane list is rejected"
 
 # --- --session is forwarded -------------------------------------------------
 
