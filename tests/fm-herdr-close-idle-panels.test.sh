@@ -41,6 +41,17 @@ case "$cmd $sub" in
     cat "$state/pane-list.json"
     exit 0
     ;;
+  "pane get")
+    pane=${args[2]:-}
+    jq -c --arg pane "$pane" '
+      .result.panes[] | select(.pane_id == $pane) | {result:{pane:.}}
+    ' "$state/pane-list.json"
+    exit 0
+    ;;
+  "session list")
+    printf '{"sessions":[{"name":"default","running":true,"socket_path":"%s/fake.sock"}]}\n' "$state"
+    exit 0
+    ;;
   "api snapshot")
     snapshot_count=$(cat "$state/snapshot-count")
     snapshot_count=$((snapshot_count + 1))
@@ -87,6 +98,9 @@ case "$cmd $sub" in
     [ -n "$pane" ] || { echo "fake herdr: missing pane id" >&2; exit 2; }
     [ ! -f "$state/close-fail-$pane" ] || exit 1
     printf '%s\n' "$pane" >> "${FM_FAKE_CLOSE_LOG:?}"
+    if [ -f "$state/focus-steal-$pane" ]; then
+      cat "$state/focus-steal-$pane" > "$state/focused-pane"
+    fi
     printf '{"result":{"closed":true}}\n'
     exit 0
     ;;
@@ -100,7 +114,7 @@ chmod +x "$FAKEBIN/herdr"
 export PATH="$FAKEBIN:$PATH"
 export FM_FAKE_HERDR_STATE="$STATE"
 export FM_FAKE_CLOSE_LOG="$CLOSE_LOG"
-: > "$STATE/focused-pane"
+printf '%s\n' p-captain > "$STATE/focused-pane"
 : > "$STATE/calls.log"
 printf '%s\n' 0 > "$STATE/snapshot-count"
 printf '%s\n' 2 > "$STATE/focus-switch-count"
@@ -245,7 +259,7 @@ write_pane_list <<'JSON'
   }
 }
 JSON
-: > "$STATE/focused-pane"
+printf '%s\n' p-captain > "$STATE/focused-pane"
 rm -f "$STATE/agent-p-agent.json"
 printf '%s\n' '{"result":{"agent":{"agent":"codex","agent_status":"idle"}}}' > "$STATE/agent-p-b.json"
 write_process p-a "$(fg_shell p-a)"
@@ -274,7 +288,7 @@ pass "live close revalidates all safety state"
 write_pane_list <<'JSON'
 {"result":{"panes":[{"pane_id":"p-race","tab_id":"t1","cwd":"/tmp/race"}]}}
 JSON
-: > "$STATE/focused-pane"
+printf '%s\n' p-captain > "$STATE/focused-pane"
 printf '%s\n' p-race > "$STATE/focused-pane-after-first"
 printf '%s\n' 0 > "$STATE/snapshot-count"
 printf '%s\n' 3 > "$STATE/focus-switch-count"
@@ -303,6 +317,21 @@ expect_code 0 "$code" "malformed process-info dry-run exit"
 echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-malformed" and (.kept[0].reason | test("invalid process-info"))' >/dev/null \
   || fail "malformed process-info must be kept: $out"
 pass "malformed process-info fails closed"
+
+# --- empty focus state fails closed -----------------------------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[{"pane_id":"p-empty-focus","tab_id":"t1","cwd":"/tmp/empty-focus"}]}}
+JSON
+: > "$STATE/focused-pane"
+write_process p-empty-focus "$(fg_shell p-empty-focus)"
+code=0
+out=$("$SCRIPT" --dry-run --json 2>&1) || code=$?
+expect_code 0 "$code" "empty focus dry-run exit"
+echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-empty-focus" and (.kept[0].reason | test("invalid snapshot"))' >/dev/null \
+  || fail "empty focused pane id must fail closed: $out"
+printf '%s\n' p-captain > "$STATE/focused-pane"
+pass "empty focused pane id fails closed"
 
 # --- unidentified foreground process fails closed ---------------------------
 
@@ -343,6 +372,32 @@ echo "$out" | jq -e '.counts.errors == 1 and .errors[0].pane_id == "p-fail"' >/d
   || fail "JSON close failure summary: $out"
 rm "$STATE/close-fail-p-fail"
 pass "JSON close failures return nonzero"
+
+# --- closed pane is reported when focus restoration fails ------------------
+
+write_pane_list <<'JSON'
+{"result":{"panes":[
+  {"pane_id":"p-restore-fail","tab_id":"t1","cwd":"/tmp/restore-fail"},
+  {"pane_id":"p-after-fail","tab_id":"t2","cwd":"/tmp/after-fail"}
+]}}
+JSON
+write_process p-restore-fail "$(fg_shell p-restore-fail)"
+write_process p-after-fail "$(fg_shell p-after-fail)"
+printf '%s\n' p-other > "$STATE/focus-steal-p-restore-fail"
+: > "$CLOSE_LOG"
+code=0
+out=$("$SCRIPT" --json 2>&1) || code=$?
+expect_code 1 "$code" "focus restoration failure exit"
+echo "$out" | jq -e '
+  .counts.closed == 1
+  and .closed[0].pane_id == "p-restore-fail"
+  and .counts.errors == 1
+  and (.errors[0].error | test("focus restoration failed"))
+' >/dev/null || fail "closed pane and focus failure must both be reported: $out"
+[ "$(cat "$CLOSE_LOG")" = p-restore-fail ] || fail "closing must stop after focus restoration failure"
+rm "$STATE/focus-steal-p-restore-fail"
+printf '%s\n' p-captain > "$STATE/focused-pane"
+pass "focus restoration failure stops further closes"
 
 # --- malformed pane list is rejected ----------------------------------------
 

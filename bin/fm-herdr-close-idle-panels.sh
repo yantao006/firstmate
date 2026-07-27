@@ -20,6 +20,10 @@
 #   - Does not kill firstmate tasks' metadata; only closes Herdr panes
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/backends/herdr.sh"
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
 usage() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
@@ -149,6 +153,7 @@ pane_keep_reason() {
     }
     if ! printf '%s' "$snapshot" | jq -e '
       (.result.snapshot.focused_pane_id | type) == "string"
+      and (.result.snapshot.focused_pane_id | length) > 0
     ' >/dev/null 2>&1; then
       PANE_REASON="invalid snapshot response"
       return
@@ -229,13 +234,25 @@ pane_keep_reason() {
 
 close_pane_focus_preserving() {
   local pane_id=$1 before after focused_pane focused_tab focused_workspace
-  local restored info
+  local restored info target_tab
+  info=$(herdr_cli pane get "$pane_id" 2>/dev/null) || return 1
+  if ! printf '%s' "$info" | jq -e --arg pane "$pane_id" '
+    .result.pane.pane_id == $pane
+    and (.result.pane.tab_id | type) == "string"
+    and (.result.pane.tab_id | length) > 0
+  ' >/dev/null 2>&1; then
+    return 1
+  fi
+  target_tab=$(printf '%s' "$info" | jq -r '.result.pane.tab_id')
   before=$(herdr_cli api snapshot 2>/dev/null) || return 1
   if ! printf '%s' "$before" | jq -e '
     .result.snapshot as $s
     | ($s.focused_pane_id | type) == "string"
+      and ($s.focused_pane_id | length) > 0
       and ($s.focused_tab_id | type) == "string"
+      and ($s.focused_tab_id | length) > 0
       and ($s.focused_workspace_id | type) == "string"
+      and ($s.focused_workspace_id | length) > 0
   ' >/dev/null 2>&1; then
     return 1
   fi
@@ -245,15 +262,19 @@ close_pane_focus_preserving() {
   if [[ "$INCLUDE_FOCUSED" -eq 0 && "$focused_pane" == "$pane_id" ]]; then
     return 2
   fi
+  if [[ "$target_tab" == "$focused_tab" && "$focused_pane" != "$pane_id" ]]; then
+    return 2
+  fi
   herdr_cli pane close "$pane_id" >/dev/null 2>&1 || return 1
   if [[ "$focused_pane" == "$pane_id" ]]; then
     return 0
   fi
   after=$(herdr_cli api snapshot 2>/dev/null) || return 3
   if printf '%s' "$after" | jq -e \
-    --arg workspace "$focused_workspace" --arg tab "$focused_tab" '
+    --arg workspace "$focused_workspace" --arg tab "$focused_tab" --arg pane "$focused_pane" '
       .result.snapshot.focused_workspace_id == $workspace
       and .result.snapshot.focused_tab_id == $tab
+      and .result.snapshot.focused_pane_id == $pane
     ' >/dev/null 2>&1; then
     return 0
   fi
@@ -267,9 +288,10 @@ close_pane_focus_preserving() {
   herdr_cli tab focus "$focused_tab" >/dev/null 2>&1 || return 3
   restored=$(herdr_cli api snapshot 2>/dev/null) || return 3
   printf '%s' "$restored" | jq -e \
-    --arg workspace "$focused_workspace" --arg tab "$focused_tab" '
+    --arg workspace "$focused_workspace" --arg tab "$focused_tab" --arg pane "$focused_pane" '
       .result.snapshot.focused_workspace_id == $workspace
       and .result.snapshot.focused_tab_id == $tab
+      and .result.snapshot.focused_pane_id == $pane
     ' >/dev/null 2>&1 || return 3
 }
 
@@ -306,6 +328,7 @@ errors=()
 CLOSED_COUNT=0
 KEPT_COUNT=0
 ERROR_COUNT=0
+STOP_CLOSING=0
 
 for pane_id in "${PANE_IDS[@]:-}"; do
   [[ -z "$pane_id" ]] && continue
@@ -330,26 +353,54 @@ for pane_id in "${PANE_IDS[@]:-}"; do
     continue
   fi
 
+  focus_lock=
+  focus_lock_held=0
+  lock_attempt=0
+  if focus_lock=$(fm_backend_herdr_presentation_session_lock_path "${SESSION:-default}" 2>/dev/null); then
+    while [[ "$lock_attempt" -lt 50 ]]; do
+      if fm_lock_try_acquire "$focus_lock"; then
+        focus_lock_held=1
+        break
+      fi
+      sleep 0.1
+      lock_attempt=$((lock_attempt + 1))
+    done
+  fi
+  if [[ "$focus_lock_held" -ne 1 ]]; then
+    kept+=("$(json_record "$pane_id" "focus lock unavailable" "$cwd" "$tab_id" reason)")
+    KEPT_COUNT=$((KEPT_COUNT + 1))
+    continue
+  fi
+
   pane_keep_reason "$pane_id"
   reason=$PANE_REASON
   if [[ -n "$reason" ]]; then
     kept+=("$(json_record "$pane_id" "changed before close: $reason" "$cwd" "$tab_id" reason)")
     KEPT_COUNT=$((KEPT_COUNT + 1))
+    fm_lock_release "$focus_lock"
     continue
   fi
 
   close_status=0
   close_pane_focus_preserving "$pane_id" || close_status=$?
+  fm_lock_release "$focus_lock"
   if [[ "$close_status" -eq 0 ]]; then
     closed+=("$(json_record "$pane_id" closed "$cwd" "$tab_id" action)")
     CLOSED_COUNT=$((CLOSED_COUNT + 1))
   elif [[ "$close_status" -eq 2 ]]; then
     kept+=("$(json_record "$pane_id" "changed before close: focused" "$cwd" "$tab_id" reason)")
     KEPT_COUNT=$((KEPT_COUNT + 1))
+  elif [[ "$close_status" -eq 3 ]]; then
+    closed+=("$(json_record "$pane_id" closed "$cwd" "$tab_id" action)")
+    CLOSED_COUNT=$((CLOSED_COUNT + 1))
+    errors+=("$(json_record "$pane_id" "pane closed but focus restoration failed" "$cwd" "$tab_id" error)")
+    ERROR_COUNT=$((ERROR_COUNT + 1))
+    STOP_CLOSING=1
   else
     errors+=("$(json_record "$pane_id" "close or focus restoration failed" "$cwd" "$tab_id" error)")
     ERROR_COUNT=$((ERROR_COUNT + 1))
   fi
+  [[ "$STOP_CLOSING" -eq 0 ]] || break
 done
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
