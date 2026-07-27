@@ -465,6 +465,16 @@ assert_grep "--session labsess" "$STATE/argv.log" "herdr must receive --session 
 echo "$out" | jq -e '.session == "labsess"' >/dev/null || fail "json session field: $out"
 pass "--session is forwarded to herdr and reported in json"
 
+# --- human session escapes control characters -------------------------------
+
+session_value=$'lab\n\033[31mred'
+code=0
+out=$("$SCRIPT" --session "$session_value" --dry-run 2>&1) || code=$?
+expect_code 0 "$code" "human session control-character exit"
+assert_contains "$out" 'session: "lab\n\u001b[31mred"' "human session control characters escaped"
+assert_not_contains "$out" $'\033' "human session output contains no raw escape"
+pass "human session escapes control characters"
+
 # --- human dry-run mode line ------------------------------------------------
 
 write_pane_list <<'JSON'

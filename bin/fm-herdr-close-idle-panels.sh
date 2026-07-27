@@ -391,7 +391,7 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
   exit 0
 fi
 
-echo "session: ${SESSION:-default (implicit)}"
+printf 'session: %s\n' "$(jq -rn --arg value "${SESSION:-default (implicit)}" '$value | tojson')"
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "mode: dry-run (no panes closed)"
 else
