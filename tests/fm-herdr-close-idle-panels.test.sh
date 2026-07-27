@@ -46,10 +46,11 @@ case "$cmd $sub" in
     snapshot_count=$((snapshot_count + 1))
     printf '%s\n' "$snapshot_count" > "$state/snapshot-count"
     focused=$(cat "$state/focused-pane")
-    if [ "$snapshot_count" -ge 2 ] && [ -f "$state/focused-pane-after-first" ]; then
+    focus_switch_count=$(cat "$state/focus-switch-count")
+    if [ "$snapshot_count" -ge "$focus_switch_count" ] && [ -f "$state/focused-pane-after-first" ]; then
       focused=$(cat "$state/focused-pane-after-first")
     fi
-    printf '{"result":{"snapshot":{"focused_pane_id":"%s"}}}\n' "$focused"
+    printf '{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"t-focus","focused_pane_id":"%s"}}}\n' "$focused"
     exit 0
     ;;
   "agent get")
@@ -102,6 +103,7 @@ export FM_FAKE_CLOSE_LOG="$CLOSE_LOG"
 : > "$STATE/focused-pane"
 : > "$STATE/calls.log"
 printf '%s\n' 0 > "$STATE/snapshot-count"
+printf '%s\n' 2 > "$STATE/focus-switch-count"
 
 write_pane_list() {
   cat > "$STATE/pane-list.json"
@@ -237,7 +239,7 @@ write_pane_list <<'JSON'
 {
   "result": {
     "panes": [
-      {"pane_id":"p-a","tab_id":"t1","cwd":"/tmp/a"},
+      {"pane_id":"p-a","tab_id":"t1","cwd":"/tmp/a|line\nnext"},
       {"pane_id":"p-b","tab_id":"t1","cwd":"/tmp/b"}
     ]
   }
@@ -254,6 +256,8 @@ out=$("$SCRIPT" --json 2>&1) || code=$?
 expect_code 0 "$code" "live close exit"
 echo "$out" | jq -e '.dry_run == false and .counts.closed == 1 and .closed[0].pane_id == "p-a" and .closed[0].action == "closed"' >/dev/null \
   || fail "live close json: $out"
+echo "$out" | jq -e '.closed[0].cwd == "/tmp/a|line\nnext" and .closed[0].tab_id == "t1"' >/dev/null \
+  || fail "live close JSON must preserve delimiter characters: $out"
 echo "$out" | jq -e '.kept[0].pane_id == "p-b"' >/dev/null || fail "agent kept on live close: $out"
 closes=$(cat "$CLOSE_LOG")
 [ "$closes" = "p-a" ] || fail "close log expected only p-a, got: $closes"
@@ -273,6 +277,7 @@ JSON
 : > "$STATE/focused-pane"
 printf '%s\n' p-race > "$STATE/focused-pane-after-first"
 printf '%s\n' 0 > "$STATE/snapshot-count"
+printf '%s\n' 3 > "$STATE/focus-switch-count"
 write_process p-race "$(fg_shell p-race)"
 : > "$CLOSE_LOG"
 code=0
@@ -282,6 +287,7 @@ echo "$out" | jq -e '.counts.closed == 0 and .kept[0].pane_id == "p-race" and (.
   || fail "newly focused pane must be kept: $out"
 [ ! -s "$CLOSE_LOG" ] || fail "newly focused pane must not be closed"
 rm "$STATE/focused-pane-after-first"
+printf '%s\n' 2 > "$STATE/focus-switch-count"
 pass "live close keeps a pane focused during scanning"
 
 # --- malformed process-info fails closed ------------------------------------

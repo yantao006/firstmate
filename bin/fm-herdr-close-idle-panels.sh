@@ -227,6 +227,62 @@ pane_keep_reason() {
   ')
 }
 
+close_pane_focus_preserving() {
+  local pane_id=$1 before after focused_pane focused_tab focused_workspace
+  local restored info
+  before=$(herdr_cli api snapshot 2>/dev/null) || return 1
+  if ! printf '%s' "$before" | jq -e '
+    .result.snapshot as $s
+    | ($s.focused_pane_id | type) == "string"
+      and ($s.focused_tab_id | type) == "string"
+      and ($s.focused_workspace_id | type) == "string"
+  ' >/dev/null 2>&1; then
+    return 1
+  fi
+  focused_pane=$(printf '%s' "$before" | jq -r '.result.snapshot.focused_pane_id')
+  focused_tab=$(printf '%s' "$before" | jq -r '.result.snapshot.focused_tab_id')
+  focused_workspace=$(printf '%s' "$before" | jq -r '.result.snapshot.focused_workspace_id')
+  if [[ "$INCLUDE_FOCUSED" -eq 0 && "$focused_pane" == "$pane_id" ]]; then
+    return 2
+  fi
+  herdr_cli pane close "$pane_id" >/dev/null 2>&1 || return 1
+  if [[ "$focused_pane" == "$pane_id" ]]; then
+    return 0
+  fi
+  after=$(herdr_cli api snapshot 2>/dev/null) || return 3
+  if printf '%s' "$after" | jq -e \
+    --arg workspace "$focused_workspace" --arg tab "$focused_tab" '
+      .result.snapshot.focused_workspace_id == $workspace
+      and .result.snapshot.focused_tab_id == $tab
+    ' >/dev/null 2>&1; then
+    return 0
+  fi
+  info=$(herdr_cli tab get "$focused_tab" 2>/dev/null) || return 3
+  if ! printf '%s' "$info" | jq -e \
+    --arg workspace "$focused_workspace" --arg tab "$focused_tab" '
+      .result.tab.workspace_id == $workspace and .result.tab.tab_id == $tab
+    ' >/dev/null 2>&1; then
+    return 3
+  fi
+  herdr_cli tab focus "$focused_tab" >/dev/null 2>&1 || return 3
+  restored=$(herdr_cli api snapshot 2>/dev/null) || return 3
+  printf '%s' "$restored" | jq -e \
+    --arg workspace "$focused_workspace" --arg tab "$focused_tab" '
+      .result.snapshot.focused_workspace_id == $workspace
+      and .result.snapshot.focused_tab_id == $tab
+    ' >/dev/null 2>&1 || return 3
+}
+
+json_record() {
+  jq -nc \
+    --arg pane_id "$1" \
+    --arg value "$2" \
+    --arg cwd "$3" \
+    --arg tab_id "$4" \
+    --arg key "$5" \
+    '{pane_id:$pane_id, cwd:$cwd, tab_id:$tab_id} + {($key):$value}'
+}
+
 list_json=$(herdr_cli pane list 2>/dev/null) || {
   echo "error: herdr pane list failed (is the server running?)" >&2
   exit 1
@@ -262,14 +318,14 @@ for pane_id in "${PANE_IDS[@]:-}"; do
   reason=$PANE_REASON
 
   if [[ -n "$reason" ]]; then
-    kept+=("$pane_id|$reason|$cwd|$tab_id")
+    kept+=("$(json_record "$pane_id" "$reason" "$cwd" "$tab_id" reason)")
     KEPT_COUNT=$((KEPT_COUNT + 1))
     continue
   fi
 
   # Idle → close (or dry-run)
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    closed+=("$pane_id|dry-run|$cwd|$tab_id")
+    closed+=("$(json_record "$pane_id" dry-run "$cwd" "$tab_id" action)")
     CLOSED_COUNT=$((CLOSED_COUNT + 1))
     continue
   fi
@@ -277,16 +333,21 @@ for pane_id in "${PANE_IDS[@]:-}"; do
   pane_keep_reason "$pane_id"
   reason=$PANE_REASON
   if [[ -n "$reason" ]]; then
-    kept+=("$pane_id|changed before close: $reason|$cwd|$tab_id")
+    kept+=("$(json_record "$pane_id" "changed before close: $reason" "$cwd" "$tab_id" reason)")
     KEPT_COUNT=$((KEPT_COUNT + 1))
     continue
   fi
 
-  if herdr_cli pane close "$pane_id" >/dev/null 2>&1; then
-    closed+=("$pane_id|closed|$cwd|$tab_id")
+  close_status=0
+  close_pane_focus_preserving "$pane_id" || close_status=$?
+  if [[ "$close_status" -eq 0 ]]; then
+    closed+=("$(json_record "$pane_id" closed "$cwd" "$tab_id" action)")
     CLOSED_COUNT=$((CLOSED_COUNT + 1))
+  elif [[ "$close_status" -eq 2 ]]; then
+    kept+=("$(json_record "$pane_id" "changed before close: focused" "$cwd" "$tab_id" reason)")
+    KEPT_COUNT=$((KEPT_COUNT + 1))
   else
-    errors+=("$pane_id|close failed|$cwd|$tab_id")
+    errors+=("$(json_record "$pane_id" "close or focus restoration failed" "$cwd" "$tab_id" error)")
     ERROR_COUNT=$((ERROR_COUNT + 1))
   fi
 done
@@ -295,9 +356,9 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
   jq -n \
     --arg session "${SESSION:-default}" \
     --argjson dry "$DRY_RUN" \
-    --argjson closed "$(printf '%s\n' "${closed[@]:-}" | jq -R -s -c 'split("\n")|map(select(length>0)|split("|")|{pane_id:.[0],action:.[1],cwd:.[2],tab_id:.[3]})')" \
-    --argjson kept "$(printf '%s\n' "${kept[@]:-}" | jq -R -s -c 'split("\n")|map(select(length>0)|split("|")|{pane_id:.[0],reason:.[1],cwd:.[2],tab_id:.[3]})')" \
-    --argjson errors "$(printf '%s\n' "${errors[@]:-}" | jq -R -s -c 'split("\n")|map(select(length>0)|split("|")|{pane_id:.[0],error:.[1],cwd:.[2],tab_id:.[3]})')" \
+    --argjson closed "$(printf '%s\n' "${closed[@]:-}" | jq -s -c '.')" \
+    --argjson kept "$(printf '%s\n' "${kept[@]:-}" | jq -s -c '.')" \
+    --argjson errors "$(printf '%s\n' "${errors[@]:-}" | jq -s -c '.')" \
     '{session:$session, dry_run:($dry==1), closed:$closed, kept:$kept, errors:$errors,
       counts:{closed:($closed|length), kept:($kept|length), errors:($errors|length)}}'
   if [[ "$ERROR_COUNT" -gt 0 ]]; then
@@ -317,7 +378,7 @@ echo
 if [[ "$CLOSED_COUNT" -gt 0 ]]; then
   echo "idle ($CLOSED_COUNT):"
   for row in "${closed[@]:-}"; do
-    IFS='|' read -r id action cwd tab <<<"$row"
+    IFS=$'\t' read -r id action cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.action,.cwd,.tab_id]|@tsv')
     echo "  $id  [$action]  tab=$tab  cwd=${cwd:-?}"
   done
   echo
@@ -329,7 +390,7 @@ fi
 if [[ "$KEPT_COUNT" -gt 0 ]]; then
   echo "kept ($KEPT_COUNT):"
   for row in "${kept[@]:-}"; do
-    IFS='|' read -r id reason cwd tab <<<"$row"
+    IFS=$'\t' read -r id reason cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.reason,.cwd,.tab_id]|@tsv')
     echo "  $id  $reason  tab=$tab"
   done
   echo
@@ -338,7 +399,7 @@ fi
 if [[ "$ERROR_COUNT" -gt 0 ]]; then
   echo "errors ($ERROR_COUNT):" >&2
   for row in "${errors[@]:-}"; do
-    IFS='|' read -r id err cwd tab <<<"$row"
+    IFS=$'\t' read -r id err cwd tab < <(printf '%s' "$row" | jq -r '[.pane_id,.error,.cwd,.tab_id]|@tsv')
     echo "  $id  $err" >&2
   done
   exit 1
