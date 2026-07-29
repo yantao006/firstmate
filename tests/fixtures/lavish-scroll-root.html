@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lavish scroll root fixture</title>
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+#scroll-root {
+  height: 100%;
+  width: 100%;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: auto;
+}
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+</style>
+</head>
+<body>
+<div id="scroll-root">
+  <main>
+    <h1>Lavish scroll root fixture</h1>
+    <p>This fixture proves the artifact document owns vertical scrolling inside Lavish.</p>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Wide column</th><th>Another wide column</th></tr>
+        <tr><td>Content</td><td>Content</td></tr>
+      </table>
+    </div>
+  </main>
+</div>
+</body>
+</html>
