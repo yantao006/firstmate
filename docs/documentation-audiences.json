@@ -144,6 +144,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/fleet-hygiene/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/fmx-respond/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -173,6 +177,10 @@
     },
     {
       "path": "AGENTS.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": "AGENTS_zh.md",
       "audience": "agent-runtime"
     },
     {
@@ -242,6 +250,10 @@
     {
       "path": "docs/fm-test-portable-shards.md",
       "audience": "maintainer-verification"
+    },
+    {
+      "path": "docs/fleet-hygiene.md",
+      "audience": "operator-current"
     },
     {
       "path": "docs/gitlab-merge-watch.md",
