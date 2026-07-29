@@ -1,0 +1,8 @@
+{
+  "packages": [
+    {
+      "source": "npm:@owlburtoe/pi-claudify",
+      "extensions": []
+    }
+  ]
+}

@@ -13,6 +13,7 @@ VISIBILITY="$ROOT/.pi/extensions/lib/fm-calm-visibility.ts"
 WATCH_EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
 OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh"
 PI_OPERATIONAL_INPUT="$ROOT/.pi/extensions/lib/fm-operational-input.ts"
+PI_SETTINGS="$ROOT/.pi/settings.json"
 PI_PACKAGE_DIR=${FM_PI_PACKAGE_DIR:-"$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent"}
 TMUX_SOCKET="fm-calm-$$"
 TMUX_SESSION="fm-calm-e2e"
@@ -122,6 +123,106 @@ test_static_contract() {
     assert_contains "$text" "create${name}ToolDefinition" "Pi calm extension does not wrap the $name built-in"
   done
   pass "Pi calm extension is presentation-only with one persisted visibility choice, no Calm status row, native working visibility, supported redraw controls, and the Firstmate watcher-tool integration"
+}
+
+test_pi_claudify_project_filter() {
+  local fixture project agent package without_settings with_settings version
+  assert_present "$PI_SETTINGS" "tracked Pi project settings are missing"
+  git -C "$ROOT" ls-files --error-unmatch -- .pi/settings.json >/dev/null 2>&1 \
+    || fail ".pi/settings.json must be tracked so linked worktrees inherit it"
+  jq -e '
+    [
+      .packages[]
+      | select(
+          type == "object"
+          and .source == "npm:@owlburtoe/pi-claudify"
+          and (.extensions | type == "array" and length == 0)
+        )
+    ]
+    | length == 1
+  ' "$PI_SETTINGS" >/dev/null \
+    || fail ".pi/settings.json must disable every pi-claudify extension"
+
+  if ! command -v pi >/dev/null 2>&1; then
+    echo "skip: pi not found for pi-claudify project-filter startup test"
+    return 0
+  fi
+  version=$(pi --version)
+  require_pi_compat_version "$version" "Pi package-filter compatibility assumptions"
+
+  fixture="$TMP_ROOT/pi-claudify-project-filter"
+  project="$fixture/project"
+  agent="$fixture/agent"
+  package="$agent/npm/node_modules/@owlburtoe/pi-claudify"
+  without_settings="$fixture/without-project-settings.out"
+  with_settings="$fixture/with-project-settings.out"
+  mkdir -p "$project/.pi/extensions/lib" "$package/extensions"
+  cp "$EXT" "$project/.pi/extensions/fm-calm.ts"
+  cp "$ASSISTANT_LAYOUT" "$project/.pi/extensions/lib/fm-calm-assistant-layout.ts"
+  cp "$OPERATIONAL_USER_LAYOUT" "$project/.pi/extensions/lib/fm-calm-operational-user-layout.ts"
+  cp "$VISIBILITY" "$project/.pi/extensions/lib/fm-calm-visibility.ts"
+  cp "$PI_OPERATIONAL_INPUT" "$project/.pi/extensions/lib/fm-operational-input.ts"
+
+  cat >"$agent/settings.json" <<'JSON'
+{"packages":["npm:@owlburtoe/pi-claudify"]}
+JSON
+  cat >"$package/package.json" <<'JSON'
+{
+  "name": "@owlburtoe/pi-claudify",
+  "version": "0.0.0-firstmate-test",
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  }
+}
+JSON
+  cat >"$package/extensions/index.ts" <<'TS'
+import { Type } from "typebox";
+
+export default function (pi) {
+  pi.registerTool({
+    name: "read",
+    label: "Fixture read",
+    description: "Reproduce the pi-claudify tool-name collision",
+    parameters: Type.Object({}),
+    async execute() {
+      return {
+        content: [{ type: "text", text: "fixture" }],
+        details: {},
+      };
+    },
+  });
+}
+TS
+
+  (
+    cd "$project" || exit
+    env -u OPENAI_API_KEY \
+      PI_CODING_AGENT_DIR="$agent" \
+      PI_OFFLINE=1 \
+      pi --approve --no-session --no-context-files --no-skills \
+        --no-prompt-templates --no-themes \
+        --provider openai --model fm-nonexistent-model -p probe
+  ) >"$without_settings" 2>&1 || true
+  assert_contains "$(cat "$without_settings")" 'Tool "read" conflicts' \
+    "firstmate-shaped fixture did not reproduce the pi-claudify collision"
+
+  cp "$PI_SETTINGS" "$project/.pi/settings.json"
+  (
+    cd "$project" || exit
+    env -u OPENAI_API_KEY \
+      PI_CODING_AGENT_DIR="$agent" \
+      PI_OFFLINE=1 \
+      pi --approve --no-session --no-context-files --no-skills \
+        --no-prompt-templates --no-themes \
+        --provider openai --model fm-nonexistent-model -p probe
+  ) >"$with_settings" 2>&1 || true
+  assert_not_contains "$(cat "$with_settings")" 'Tool "read" conflicts' \
+    "tracked project settings did not suppress pi-claudify extensions"
+  assert_not_contains "$(cat "$with_settings")" "Failed to load extension" \
+    "Pi extension startup failed after applying tracked project settings"
+  assert_contains "$(cat "$with_settings")" 'No API key found for openai.' \
+    "offline Pi startup did not advance past extension loading"
+  pass "tracked Pi project settings suppress pi-claudify tool conflicts in linked-worktree startup"
 }
 
 test_home_resolution() {
@@ -1682,8 +1783,8 @@ JSON
   assert_not_contains "$(cat "$default_snapshot")" 'Run `bin/fm-session-start.sh` now' \
     "native session-start context unexpectedly rendered while Calm was off"
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" C-o
-  wait_for_text "$expanded_snapshot" "escape to interrupt" \
-    || fail "Ctrl+O did not retain Pi's ordinary startup and tool expansion behavior"
+  wait_for_text "$expanded_snapshot" "CALM_E2E_OUTPUT" \
+    || fail "Ctrl+O did not restore expanded tool output"
   assert_contains "$(cat "$expanded_snapshot")" "CALM_E2E_OUTPUT" "ordinary Ctrl+O expansion hid tool activity while calm mode was off"
 
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" -l "/calm"
@@ -1976,6 +2077,7 @@ JS
 }
 
 test_static_contract
+test_pi_claudify_project_filter
 test_home_resolution
 test_rendering_and_session_lifecycle
 test_operational_followup_turn_e2e

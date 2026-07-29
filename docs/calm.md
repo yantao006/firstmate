@@ -21,6 +21,7 @@ These are supported-API boundaries rather than hidden-content failures.
 [`calm-mode-feasibility.md`](calm-mode-feasibility.md) owns the version-scoped renderer taxonomy and empirical evidence.
 [`configuration.md`](configuration.md#pi-calm-preference-configcalm) owns the persisted preference file and resolution rules.
 `.pi/extensions/lib/fm-calm-visibility.ts` owns the visibility policy, and `.pi/extensions/lib/fm-calm-operational-user-layout.ts` owns the zero-height operational-user row adapter.
+`.pi/settings.json` is a tracked runtime prerequisite that must ship with the repository so every linked worktree disables `npm:@owlburtoe/pi-claudify` extensions before `fm-calm` loads.
 
 Regression entry points:
 
