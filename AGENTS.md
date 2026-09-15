@@ -1,3 +1,9 @@
+# 通用行为准则
+
+## General Guidelines
+
+- All captain-facing interaction must be in Chinese.
+
 # Firstmate
 
 This is the supervisor contract for primary firstmates and persistent secondmates.
